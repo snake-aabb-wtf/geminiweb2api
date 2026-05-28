@@ -180,32 +180,32 @@ def parse_har_file(har_path: str) -> dict:
         if not info.get("auth_header"):
             info["auth_type"] = "cookie"
 
+    # Parse JSPB header for model selection fields
+    for h in req.get("headers", []):
+        if h.get("name", "").lower() == "x-goog-ext-525001261-jspb":
+            try:
+                jspb = json.loads(h.get("value", "[]"))
+                if isinstance(jspb, list):
+                    if len(jspb) > 14 and isinstance(jspb[14], int):
+                        info["model_family"] = jspb[14]
+                    if len(jspb) > 15 and isinstance(jspb[15], int):
+                        info["thinking_mode"] = jspb[15]
+                    if len(jspb) > 16 and isinstance(jspb[16], str):
+                        info["session_uuid"] = jspb[16]
+                    if len(jspb) > 4 and isinstance(jspb[4], str):
+                        info["request_hash"] = jspb[4]
+            except (json.JSONDecodeError, TypeError):
+                pass
+
     return info
 
 
-MUTABLE_KEYS = {
-    "TARGET_URL", "CHAT_ENDPOINT",
-    "AUTH_TYPE", "COOKIES", "AUTH_HEADER",
-    "BL_PARAM", "F_SID", "HL", "AT", "SN_PARAM",
-    "_CONV_ID", "_RESP_ID", "_RC_ID", "_TOKEN26",
-    "STREAMING", "WEBSOCKET", "POW",
-}
+PROFILE_FIELDS = [
+    "MODEL_FAMILY", "THINKING_MODE", "F_SID", "AT",
+    "SN_PARAM", "BL_PARAM", "HL", "UUID", "HASH",
+]
 
-IMMUTABLE_HEADER = """# ============================================
-# 不易变部分 — 服务器配置（配置工具不会修改）
-# ============================================
-"""
-MUTABLE_HEADER = """
-# ============================================
-# 异变部分 — 账号鉴权凭证（配置工具只更新此段）
-# ============================================
-"""
-
-DEFAULT_IMMUTABLE = """MODEL_NAME=gpt-4o
-HOST=0.0.0.0
-PORT=18000
-API_KEY=sk-web2api-placeholder
-DSML_ENABLED=false"""
+SERVER_FIELDS = {"HOST", "PORT", "API_KEY", "MODEL_NAMES", "DEFAULT_MODEL"}
 
 
 def read_existing_env() -> dict:
@@ -223,41 +223,68 @@ def read_existing_env() -> dict:
     return result
 
 
-def merge_env_with_auth(auth_info: dict) -> str:
+def update_env_with_profile(auth_info: dict, model_name: str) -> str:
     existing = read_existing_env()
 
-    immutable_lines = []
-    mutable_lines = []
+    # Build server config section (keep existing, or use defaults)
+    server_lines = []
+    defaults = {"HOST": "0.0.0.0", "PORT": "1800", "API_KEY": "sk-web2api-placeholder"}
+    for f in ("HOST", "PORT", "API_KEY"):
+        val = existing.get(f, defaults[f])
+        server_lines.append(f"{f}={val}")
 
-    def add_mutable(key, val):
-        if val is None:
-            val = ""
-        val_str = str(val)
-        if val_str:
-            mutable_lines.append(f"{key}={val_str}")
+    # Update MODEL_NAMES list - add model_name if not present
+    existing_names = set()
+    raw_names = existing.get("MODEL_NAMES", "")
+    if raw_names:
+        existing_names = set(n.strip() for n in raw_names.split(",") if n.strip())
+    existing_names.add(model_name)
+    server_lines.append(f"MODEL_NAMES={','.join(sorted(existing_names))}")
 
-    for k in sorted(MUTABLE_KEYS):
-        key_lower = k.lower()
-        if key_lower in auth_info:
-            v = auth_info[key_lower]
-        elif k in auth_info:
-            v = auth_info[k]
-        else:
-            continue
-        if v and str(v).strip():
-            mutable_lines.append(f"{k}={v}")
+    default = existing.get("DEFAULT_MODEL", model_name)
+    server_lines.append(f"DEFAULT_MODEL={default}")
+    server_lines.append("")
 
+    # Build profile section
+    suffix = f"_{model_name}"
+    profile_lines = []
+    # model_family/thinking_mode from JSPB
+    mf = auth_info.get("model_family", 1)
+    tm = auth_info.get("thinking_mode", 1)
+    profile_lines.append(f"# Profile: {model_name}  (family={mf}, thinking={tm})")
+    profile_lines.append(f"MODEL_FAMILY{suffix}={mf}")
+    profile_lines.append(f"THINKING_MODE{suffix}={tm}")
+    profile_lines.append(f"F_SID{suffix}={auth_info.get('f_sid', '')}")
+    profile_lines.append(f"AT{suffix}={auth_info.get('at', '')}")
+    profile_lines.append(f"SN_PARAM{suffix}={auth_info.get('sn_param', '')}")
+    profile_lines.append(f"BL_PARAM{suffix}={auth_info.get('bl_param', '')}")
+    profile_lines.append(f"HL{suffix}={auth_info.get('hl', 'zh-CN')}")
+    profile_lines.append(f"UUID{suffix}={auth_info.get('session_uuid', '')}")
+    profile_lines.append(f"HASH{suffix}={auth_info.get('request_hash', '')}")
+    profile_lines.append("")
+
+    # Build remaining profiles (keep existing ones that aren't this one)
+    other_profiles = []
     for k, v in existing.items():
-        if k in MUTABLE_KEYS:
+        if k.startswith("MODEL_NAMES") or k.startswith("DEFAULT_MODEL"):
             continue
-        if v and str(v).strip():
-            immutable_lines.append(f"{k}={v}")
+        found = False
+        for pf in PROFILE_FIELDS:
+            if k.startswith(pf + "_") and k != pf + suffix:
+                found = True
+                break
+        if found or k in SERVER_FIELDS:
+            continue
+        other_profiles.append(f"{k}={v}")
 
-    if not immutable_lines:
-        immutable_lines = DEFAULT_IMMUTABLE.split("\n")
-
-    result = IMMUTABLE_HEADER + "\n".join(immutable_lines) + "\n"
-    result += MUTABLE_HEADER + "\n".join(mutable_lines) + "\n"
+    result = "# ============================================\n"
+    result += "# HOST / PORT / API_KEY\n"
+    result += "# ============================================\n"
+    result += "\n".join(server_lines) + "\n"
+    result += "\n".join(profile_lines)
+    if other_profiles:
+        result += "# Other existing config\n"
+        result += "\n".join(other_profiles) + "\n"
     return result
 
 
@@ -284,7 +311,7 @@ class ConfigToolGUI:
 
         # HAR file selection
         file_frame = ttk.Frame(main_frame)
-        file_frame.pack(fill=tk.X, pady=(0, 12))
+        file_frame.pack(fill=tk.X, pady=(0, 8))
 
         ttk.Label(file_frame, text="HAR 文件:", font=("Segoe UI", 10, "bold"))\
             .pack(side=tk.LEFT, padx=(0, 8))
@@ -297,6 +324,20 @@ class ConfigToolGUI:
             .pack(side=tk.LEFT)
         ttk.Button(file_frame, text="解析", command=self._parse)\
             .pack(side=tk.LEFT, padx=(4, 0))
+
+        # Model name
+        name_frame = ttk.Frame(main_frame)
+        name_frame.pack(fill=tk.X, pady=(0, 12))
+
+        ttk.Label(name_frame, text="模型名:", font=("Segoe UI", 10, "bold"))\
+            .pack(side=tk.LEFT, padx=(0, 8))
+
+        self.model_name_var = tk.StringVar(value="gemini-3.5-flash")
+        self.model_name_entry = ttk.Entry(name_frame, textvariable=self.model_name_var, width=30)
+        self.model_name_entry.pack(side=tk.LEFT, padx=(0, 8))
+
+        ttk.Label(name_frame, text="常用: gemini-3.5-flash / gemini-3.1-flash-lite",
+                  foreground="#888", font=("Segoe UI", 8)).pack(side=tk.LEFT)
 
         # Notebook for results
         self.notebook = ttk.Notebook(main_frame)
@@ -403,8 +444,17 @@ class ConfigToolGUI:
         # Show in tree
         self._populate_tree(info)
 
-        # Build env - 只更新鉴权部分，保留不易变部分
-        self._env_content = merge_env_with_auth(info)
+        # Auto-detect model family for name hint
+        mf = info.get("model_family", 1)
+        tm = info.get("thinking_mode", 1)
+        name_hint = {1: "gemini-3.5-flash", 6: "gemini-3.1-flash-lite"}.get(mf, f"model-family-{mf}")
+        if tm == 2:
+            name_hint += "-adv"
+        self.model_name_var.set(name_hint)
+
+        # Build env - 只更新对应 profile，保留其他部分
+        model_name = self.model_name_var.get().strip()
+        self._env_content = update_env_with_profile(info, model_name)
         self.env_text.delete("1.0", tk.END)
         self.env_text.insert("1.0", self._env_content)
         self.env_text.see("1.0")
@@ -442,6 +492,10 @@ class ConfigToolGUI:
             ("响应ID (resp_id)", "_resp_id"),
             ("内容引用ID (rc_id)", "_rc_id"),
             ("令牌 (token26)", "_token26"),
+            ("模型家族", "model_family"),
+            ("思考模式", "thinking_mode"),
+            ("会话 UUID", "session_uuid"),
+            ("请求 Hash", "request_hash"),
             ("流式支持", "is_streaming"),
             ("WebSocket", "has_websocket"),
             ("PoW 挑战", "has_pow"),
@@ -465,12 +519,22 @@ class ConfigToolGUI:
             messagebox.showwarning("提示", "请先解析一个 HAR 文件")
             return
 
+        model_name = self.model_name_var.get().strip()
+        if not model_name:
+            messagebox.showwarning("提示", "请输入模型名")
+            return
+
+        # Rebuild env with current model name and info
+        self._env_content = update_env_with_profile(self._parsed_info or {}, model_name)
+        self.env_text.delete("1.0", tk.END)
+        self.env_text.insert("1.0", self._env_content)
+
         try:
             with open(ENV_PATH, "w", encoding="utf-8") as f:
                 f.write(self._env_content)
-            self.status_var.set(f"✓ 已保存到 {ENV_PATH}")
+            self.status_var.set(f"✓ Profile '{model_name}' 已保存到 {ENV_PATH}")
             messagebox.showinfo("保存成功",
-                                f"配置已保存到:\n{ENV_PATH}\n\n"
+                                f"Profile '{model_name}' 已保存到:\n{ENV_PATH}\n\n"
                                 "现在可以启动代理服务器了。")
         except Exception as e:
             messagebox.showerror("保存失败", str(e))
@@ -490,7 +554,8 @@ class ConfigToolGUI:
                 return
 
             existing = read_existing_env()
-            port = existing.get("PORT", "18000")
+            port = existing.get("PORT", "1800")
+            dmodel = existing.get("DEFAULT_MODEL", "gemini-3.5-flash")
 
             proc = subprocess.Popen(
                 [sys.executable, "-u", server_script, port],
@@ -499,11 +564,13 @@ class ConfigToolGUI:
             )
 
             self.status_var.set(f"✓ 服务器已启动 (PID: {proc.pid})")
+            models = existing.get("MODEL_NAMES", dmodel)
             messagebox.showinfo("服务器已启动",
                                 f"代理服务器已在后台启动 (PID: {proc.pid})\n\n"
                                 f"访问地址: http://localhost:{port}\n\n"
+                                f"可用模型: {models}\n\n"
                                 f"测试命令:\n"
-                                f'curl http://localhost:{port}/v1/chat/completions -H "Content-Type: application/json" -d \'{{"model":"gpt-4o","messages":[{{"role":"user","content":"hi"}}]}}\'')
+                                f'curl http://localhost:{port}/v1/chat/completions -H "Content-Type: application/json" -d \'{{"model":"{dmodel}","messages":[{{"role":"user","content":"hi"}}]}}\'')
         except Exception as e:
             messagebox.showerror("启动失败", str(e))
 

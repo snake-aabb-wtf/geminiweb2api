@@ -14,10 +14,17 @@ class GeminiHarAnalysis:
         self._reqid = 4569005
         self.rt = "c"
         self.at = ""
-        self.sn_param = "M2UyNjgxMmMtZjljOS00"
+        self.sn_param = ""
         self.template_params = {}
         self.content_field_path = ""
         self.is_streaming = False
+
+        # JSPB fields from x-goog-ext-525001261-jspb header
+        self.model_family = 1       # 1=Flash, 6=Flash Lite
+        self.thinking_mode = 1      # 1=标准, 2=进阶/扩展
+        self.session_uuid = ""
+        self.request_hash = ""
+
 
 def parse_har(har_path):
     with open(har_path, "r", encoding="utf-8") as f:
@@ -34,7 +41,9 @@ def parse_har(har_path):
             break
 
     if not chat_entry:
-        chat_entry = entries[0]
+        chat_entry = entries[0] if entries else None
+        if not chat_entry:
+            raise ValueError("HAR file has no entries")
 
     req = chat_entry.get("request", {})
     url = req.get("url", "")
@@ -47,6 +56,9 @@ def parse_har(har_path):
         skip = {":method", ":path", ":authority", ":scheme", "content-length", "cookie"}
         if name.lower() not in skip:
             analysis.headers[name] = val
+
+        if name.lower() == "x-goog-ext-525001261-jspb":
+            _parse_jspb(analysis, val)
 
     for h in req.get("headers", []):
         if h.get("name", "").lower() == "cookie":
@@ -76,6 +88,10 @@ def parse_har(har_path):
                         "language": inner[1][0] if isinstance(inner[1], list) and len(inner[1]) > 0 else "zh-CN",
                         "token": inner[3] if len(inner) > 3 else "",
                     }
+                if len(inner) > 79:
+                    analysis.model_family = inner[79] if inner[79] is not None else analysis.model_family
+                if len(inner) > 80:
+                    analysis.thinking_mode = inner[80] if inner[80] is not None else analysis.thinking_mode
         except:
             pass
 
@@ -103,6 +119,24 @@ def parse_har(har_path):
 
     return analysis
 
+
+def _parse_jspb(analysis, val: str):
+    try:
+        arr = json.loads(val)
+        if not isinstance(arr, list) or len(arr) < 16:
+            return
+        if len(arr) > 14 and isinstance(arr[14], int):
+            analysis.model_family = arr[14]
+        if len(arr) > 15 and isinstance(arr[15], int):
+            analysis.thinking_mode = arr[15]
+        if len(arr) > 16 and isinstance(arr[16], str):
+            analysis.session_uuid = arr[16]
+        if len(arr) > 4 and isinstance(arr[4], str):
+            analysis.request_hash = arr[4]
+    except (json.JSONDecodeError, TypeError, IndexError):
+        pass
+
+
 def _find_content_path(resp_text):
     lines = resp_text.strip().split("\n")
     for i, line in enumerate(lines):
@@ -129,11 +163,3 @@ def _find_content_path(resp_text):
             except:
                 pass
     return "batch_response.content"
-
-if __name__ == "__main__":
-    analysis = parse_har("gemini.google.com.har")
-    print(f"Base URL: {analysis.base_url}")
-    print(f"Chat Endpoint: {analysis.chat_endpoint}")
-    print(f"Content Field: {analysis.content_field_path}")
-    print(f"Template Params: {analysis.template_params}")
-    print(f"Headers count: {len(analysis.headers)}")

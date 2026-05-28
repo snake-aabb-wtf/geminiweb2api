@@ -2,72 +2,102 @@ import json
 import re
 import time
 import httpx
-from urllib.parse import urlencode, parse_qs, quote
+from dataclasses import dataclass, field
+from urllib.parse import urlencode
 from typing import AsyncGenerator, Optional
 
 CHAT_ENDPOINT = "/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate"
 
+
+@dataclass
+class ModelProfile:
+    name: str
+    model_family: int = 1
+    thinking_mode: int = 1
+    f_sid: str = ""
+    at: str = ""
+    sn_param: str = ""
+    bl_param: str = ""
+    hl: str = "zh-CN"
+    session_uuid: str = ""
+    request_hash: str = ""
+    headers: dict = field(default_factory=dict)
+
+
 class ChatAdapter:
-    def __init__(self, cookies: str, base_url: str, dsml_enabled: bool = True):
-        self.headers = {}
-        self.base_url = base_url.rstrip("/")
-        self.chat_endpoint = CHAT_ENDPOINT
-        self.cookies = cookies
-        self.dsml_enabled = dsml_enabled
-        self.dsml_ready = False
-        self.auth_type = "none"
-
-        self.bl_param = "boq_assistant-bard-web-server_20260525.09_p0"
-        self.f_sid = ""
-        self.hl = "zh-CN"
-        self.at = ""
+    def __init__(self, profiles: dict[str, ModelProfile], default_model: str):
+        self.profiles = profiles
+        self._active_name = default_model
         self._reqid = int(time.time() * 1000) % 10000000
-        self.rt = "c"
-        self._sn_param = ""
 
-    def set_har_params(self, analysis):
-        self.bl_param = analysis.bl_param
-        self.f_sid = analysis.f_sid
-        self.hl = analysis.hl
-        self._reqid = int(analysis._reqid) + 1
-        self.rt = analysis.rt
-        self.at = analysis.at
-        self._sn_param = analysis.template_params.get("token", "")
-        self.headers.update(analysis.headers)
+    @property
+    def _profile(self) -> ModelProfile:
+        return self.profiles[self._active_name]
+
+    def set_model(self, name: str) -> bool:
+        if name in self.profiles:
+            self._active_name = name
+            return True
+        return False
+
+    @property
+    def model_name(self) -> str:
+        return self._active_name
+
+    def _build_jspb_header(self, for_stream: bool = True) -> str:
+        p = self._profile
+        if for_stream:
+            return json.dumps([
+                1, None, None, None, p.request_hash or None, None, None, 0,
+                [4, 5, 6, 8], None, None, 1, None, None,
+                p.model_family, p.thinking_mode, p.session_uuid or None
+            ], separators=(",", ":"))
+        return json.dumps([
+            1, None, None, None, None, None, None, None,
+            [4, 5, 6, 8], None, None, None, None, None,
+            p.model_family, p.thinking_mode, p.session_uuid or None
+        ], separators=(",", ":"))
 
     def _build_request_body(self, messages: list, stream: bool = False) -> str:
+        p = self._profile
         last = messages[-1]["content"] if messages else ""
         if isinstance(last, list):
-            last = " ".join(p.get("text", "") for p in last if p.get("type") == "text")
+            last = " ".join(item.get("text", "") for item in last if item.get("type") == "text")
         self._reqid += 1
 
+        meta = ["", "", "", None, None, None, None, None, None, ""]
         inner = [
             [last, 0, None, None, None, None, 0],
-            [self.hl],
-            ["", "", "", None, None, None, None, None, None, ""],
-            self._sn_param,
+            [p.hl],
+            meta,
+            p.sn_param,
         ]
+        while len(inner) < 81:
+            inner.append(None)
+        inner[79] = p.model_family
+        inner[80] = p.thinking_mode
+
         inner_json = json.dumps(inner, ensure_ascii=False, separators=(",", ":"))
         outer = [None, inner_json]
         freq = json.dumps(outer, ensure_ascii=False, separators=(",", ":"))
 
         params = {
-            "bl": self.bl_param,
-            "f.sid": self.f_sid,
-            "hl": self.hl,
+            "bl": p.bl_param,
+            "f.sid": p.f_sid,
+            "hl": p.hl,
             "_reqid": str(self._reqid),
-            "rt": self.rt,
+            "rt": "c",
         }
         query_string = urlencode(params)
         body = {"f.req": freq}
-        if self.at:
-            body["at"] = self.at
+        if p.at:
+            body["at"] = p.at
         return urlencode(body), query_string
 
     def _parse_response(self, text: str) -> str:
         lines = text.strip().split("\n")
         contents = []
-        for i, line in enumerate(lines):
+        for line in lines:
             line = line.strip()
             if not line or line.startswith(")]}'") or line.isdigit():
                 continue
@@ -87,10 +117,7 @@ class ChatAdapter:
                 inner_data = json.loads(third)
             except (json.JSONDecodeError, TypeError):
                 continue
-            if not isinstance(inner_data, list):
-                continue
-
-            if len(inner_data) < 5:
+            if not isinstance(inner_data, list) or len(inner_data) < 5:
                 continue
             fourth = inner_data[4]
             if not isinstance(fourth, list):
@@ -112,43 +139,36 @@ class ChatAdapter:
         body, query = self._build_request_body(messages, stream)
         return {"body": body, "query": query}
 
+    def _make_headers(self) -> dict:
+        p = self._profile
+        headers = dict(p.headers)
+        headers["Content-Type"] = "application/x-www-form-urlencoded;charset=UTF-8"
+        headers["x-goog-ext-525001261-jspb"] = self._build_jspb_header(for_stream=True)
+        return headers
+
     async def send_request(self, payload: dict) -> dict:
         query = payload.get("query", "")
         body = payload.get("body", "")
-        url = f"{self.base_url}{self.chat_endpoint}?{query}"
-        headers = dict(self.headers)
-        headers["Content-Type"] = "application/x-www-form-urlencoded;charset=UTF-8"
-        if self.cookies:
-            headers["Cookie"] = self.cookies
+        url = f"https://gemini.google.com{CHAT_ENDPOINT}?{query}"
+        headers = self._make_headers()
         async with httpx.AsyncClient(headers=headers, timeout=120) as client:
             resp = await client.post(url, data=body)
             resp.raise_for_status()
-            text = resp.text
-            content = self._parse_response(text)
+            content = self._parse_response(resp.text)
             return self.convert_response({"text": content})
 
     async def stream_request(self, payload: dict) -> AsyncGenerator[bytes, None]:
         query = payload.get("query", "")
         body = payload.get("body", "")
-        url = f"{self.base_url}{self.chat_endpoint}?{query}"
-        headers = dict(self.headers)
-        headers["Content-Type"] = "application/x-www-form-urlencoded;charset=UTF-8"
-        if self.cookies:
-            headers["Cookie"] = self.cookies
+        url = f"https://gemini.google.com{CHAT_ENDPOINT}?{query}"
+        headers = self._make_headers()
         async with httpx.AsyncClient(headers=headers, timeout=120) as client:
             resp = await client.post(url, data=body)
             resp.raise_for_status()
-            text = resp.text
-            content = self._parse_response(text)
+            content = self._parse_response(resp.text)
             if content:
                 yield self._build_content_chunk(content)
             yield b"data: [DONE]\n\n"
-
-    def _extract_content_from_data(self, data: dict) -> Optional[str]:
-        return data.get("text") or data.get("content") or None
-
-    def _extract_content_from_json(self, data: dict) -> Optional[str]:
-        return data.get("text") or data.get("content") or data.get("answer") or None
 
     def _build_content_chunk(self, text: str) -> bytes:
         chunk = {"choices": [{"delta": {"content": text}, "index": 0}]}
@@ -160,7 +180,7 @@ class ChatAdapter:
             "id": f"chatcmpl-{int(time.time())}",
             "object": "chat.completion",
             "created": int(time.time()),
-            "model": "gpt-4o",
+            "model": self._active_name,
             "choices": [{
                 "index": 0,
                 "message": {"role": "assistant", "content": content},
