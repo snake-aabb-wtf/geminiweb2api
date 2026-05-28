@@ -200,12 +200,7 @@ def parse_har_file(har_path: str) -> dict:
     return info
 
 
-PROFILE_FIELDS = [
-    "MODEL_FAMILY", "THINKING_MODE", "F_SID", "AT",
-    "SN_PARAM", "BL_PARAM", "HL", "UUID", "HASH",
-]
-
-SERVER_FIELDS = {"HOST", "PORT", "API_KEY", "MODEL_NAMES", "DEFAULT_MODEL"}
+SERVER_FIELDS = {"HOST", "PORT", "API_KEY", "ROTATION_STRATEGY", "MAX_ERRORS_BEFORE_DISABLE", "PROFILES", "DEFAULT_MODEL"}
 
 
 def read_existing_env() -> dict:
@@ -223,69 +218,68 @@ def read_existing_env() -> dict:
     return result
 
 
-def update_env_with_profile(auth_info: dict, model_name: str) -> str:
+def update_env_with_profile(auth_info: dict, model_name: str, account_name: str) -> str:
     existing = read_existing_env()
+    lines = []
 
-    # Build server config section (keep existing, or use defaults)
-    server_lines = []
-    defaults = {"HOST": "0.0.0.0", "PORT": "1800", "API_KEY": "sk-web2api-placeholder"}
-    for f in ("HOST", "PORT", "API_KEY"):
-        val = existing.get(f, defaults[f])
-        server_lines.append(f"{f}={val}")
+    # Server config
+    defaults = {"HOST": "0.0.0.0", "PORT": "1800", "API_KEY": "sk-web2api-placeholder",
+                "ROTATION_STRATEGY": "least-recently-used", "MAX_ERRORS_BEFORE_DISABLE": "3"}
+    for f in ("HOST", "PORT", "API_KEY", "ROTATION_STRATEGY", "MAX_ERRORS_BEFORE_DISABLE"):
+        val = existing.get(f, defaults.get(f, ""))
+        if val:
+            lines.append(f"{f}={val}")
 
-    # Update MODEL_NAMES list - add model_name if not present
-    existing_names = set()
-    raw_names = existing.get("MODEL_NAMES", "")
-    if raw_names:
-        existing_names = set(n.strip() for n in raw_names.split(",") if n.strip())
-    existing_names.add(model_name)
-    server_lines.append(f"MODEL_NAMES={','.join(sorted(existing_names))}")
-
-    default = existing.get("DEFAULT_MODEL", model_name)
-    server_lines.append(f"DEFAULT_MODEL={default}")
-    server_lines.append("")
-
-    # Build profile section
-    suffix = f"_{model_name}"
-    profile_lines = []
-    # model_family/thinking_mode from JSPB
     mf = auth_info.get("model_family", 1)
     tm = auth_info.get("thinking_mode", 1)
-    profile_lines.append(f"# Profile: {model_name}  (family={mf}, thinking={tm})")
-    profile_lines.append(f"MODEL_FAMILY{suffix}={mf}")
-    profile_lines.append(f"THINKING_MODE{suffix}={tm}")
-    profile_lines.append(f"F_SID{suffix}={auth_info.get('f_sid', '')}")
-    profile_lines.append(f"AT{suffix}={auth_info.get('at', '')}")
-    profile_lines.append(f"SN_PARAM{suffix}={auth_info.get('sn_param', '')}")
-    profile_lines.append(f"BL_PARAM{suffix}={auth_info.get('bl_param', '')}")
-    profile_lines.append(f"HL{suffix}={auth_info.get('hl', 'zh-CN')}")
-    profile_lines.append(f"UUID{suffix}={auth_info.get('session_uuid', '')}")
-    profile_lines.append(f"HASH{suffix}={auth_info.get('request_hash', '')}")
-    profile_lines.append("")
 
-    # Build remaining profiles (keep existing ones that aren't this one)
-    other_profiles = []
+    # PROFILES list — add model if new
+    existing_profiles = set()
+    raw = existing.get("PROFILES", "")
+    if raw:
+        existing_profiles = set(n.strip() for n in raw.split(",") if n.strip())
+    existing_profiles.add(model_name)
+    lines.append(f"PROFILES={','.join(sorted(existing_profiles))}")
+    lines.append(f"DEFAULT_MODEL={existing.get('DEFAULT_MODEL', model_name)}")
+    lines.append("")
+
+    # Profile config (model_family + thinking_mode)
+    lines.append(f"# Profile: {model_name}  (family={mf}, thinking={tm})")
+    lines.append(f"MODEL_FAMILY_{model_name}={mf}")
+    lines.append(f"THINKING_MODE_{model_name}={tm}")
+    lines.append("")
+
+    # Account entry
+    lines.append(f"# Account: {account_name}")
+    lines.append(f"ACCOUNT_{account_name}_F_SID={auth_info.get('f_sid', '')}")
+    lines.append(f"ACCOUNT_{account_name}_AT={auth_info.get('at', '')}")
+    lines.append(f"ACCOUNT_{account_name}_SN_PARAM={auth_info.get('sn_param', '')}")
+    lines.append(f"ACCOUNT_{account_name}_BL_PARAM={auth_info.get('bl_param', '')}")
+    lines.append(f"ACCOUNT_{account_name}_HL={auth_info.get('hl', 'zh-CN')}")
+    lines.append(f"ACCOUNT_{account_name}_UUID={auth_info.get('session_uuid', '')}")
+    lines.append(f"ACCOUNT_{account_name}_HASH={auth_info.get('request_hash', '')}")
+    lines.append(f"ACCOUNT_{account_name}_ENABLED=true")
+    lines.append(f"ACCOUNT_{account_name}_MODELS={model_name}")
+    lines.append("")
+
+    # Preserve other non-matching entries
+    skip_prefixes = {"HOST", "PORT", "API_KEY", "ROTATION_STRATEGY", "MAX_ERRORS_BEFORE_DISABLE",
+                     "PROFILES", "DEFAULT_MODEL"}
     for k, v in existing.items():
-        if k.startswith("MODEL_NAMES") or k.startswith("DEFAULT_MODEL"):
+        if k in skip_prefixes:
             continue
-        found = False
-        for pf in PROFILE_FIELDS:
-            if k.startswith(pf + "_") and k != pf + suffix:
-                found = True
-                break
-        if found or k in SERVER_FIELDS:
+        if k.startswith("MODEL_FAMILY_") or k.startswith("THINKING_MODE_"):
+            if k.endswith(f"_{model_name}"):
+                continue
+        if k.startswith("ACCOUNT_"):
             continue
-        other_profiles.append(f"{k}={v}")
+        if v:
+            lines.append(f"{k}={v}")
 
-    result = "# ============================================\n"
-    result += "# HOST / PORT / API_KEY\n"
-    result += "# ============================================\n"
-    result += "\n".join(server_lines) + "\n"
-    result += "\n".join(profile_lines)
-    if other_profiles:
-        result += "# Other existing config\n"
-        result += "\n".join(other_profiles) + "\n"
-    return result
+    return "# ============================================\n" \
+           "# 服务器配置\n" \
+           "# ============================================\n" + \
+           "\n".join(lines) + "\n"
 
 
 class ConfigToolGUI:
@@ -337,6 +331,20 @@ class ConfigToolGUI:
         self.model_name_entry.pack(side=tk.LEFT, padx=(0, 8))
 
         ttk.Label(name_frame, text="常用: gemini-3.5-flash / gemini-3.1-flash-lite",
+                  foreground="#888", font=("Segoe UI", 8)).pack(side=tk.LEFT)
+
+        # Account name
+        acct_frame = ttk.Frame(main_frame)
+        acct_frame.pack(fill=tk.X, pady=(0, 12))
+
+        ttk.Label(acct_frame, text="账号名:", font=("Segoe UI", 10, "bold"))\
+            .pack(side=tk.LEFT, padx=(0, 8))
+
+        self.acct_name_var = tk.StringVar(value="default")
+        self.acct_name_entry = ttk.Entry(acct_frame, textvariable=self.acct_name_var, width=30)
+        self.acct_name_entry.pack(side=tk.LEFT, padx=(0, 8))
+
+        ttk.Label(acct_frame, text="标识不同 Google 账号，如 main / backup",
                   foreground="#888", font=("Segoe UI", 8)).pack(side=tk.LEFT)
 
         # Notebook for results
@@ -452,9 +460,10 @@ class ConfigToolGUI:
             name_hint += "-adv"
         self.model_name_var.set(name_hint)
 
-        # Build env - 只更新对应 profile，保留其他部分
+        # Build env - 只更新对应 profile+account，保留其他部分
         model_name = self.model_name_var.get().strip()
-        self._env_content = update_env_with_profile(info, model_name)
+        account_name = self.acct_name_var.get().strip()
+        self._env_content = update_env_with_profile(info, model_name, account_name)
         self.env_text.delete("1.0", tk.END)
         self.env_text.insert("1.0", self._env_content)
         self.env_text.see("1.0")
@@ -520,21 +529,25 @@ class ConfigToolGUI:
             return
 
         model_name = self.model_name_var.get().strip()
+        account_name = self.acct_name_var.get().strip()
         if not model_name:
             messagebox.showwarning("提示", "请输入模型名")
             return
+        if not account_name:
+            messagebox.showwarning("提示", "请输入账号名")
+            return
 
-        # Rebuild env with current model name and info
-        self._env_content = update_env_with_profile(self._parsed_info or {}, model_name)
+        # Rebuild env with current model name, account name, and info
+        self._env_content = update_env_with_profile(self._parsed_info or {}, model_name, account_name)
         self.env_text.delete("1.0", tk.END)
         self.env_text.insert("1.0", self._env_content)
 
         try:
             with open(ENV_PATH, "w", encoding="utf-8") as f:
                 f.write(self._env_content)
-            self.status_var.set(f"✓ Profile '{model_name}' 已保存到 {ENV_PATH}")
+            self.status_var.set(f"✓ Account '{account_name}' + Profile '{model_name}' 已保存")
             messagebox.showinfo("保存成功",
-                                f"Profile '{model_name}' 已保存到:\n{ENV_PATH}\n\n"
+                                f"账号 '{account_name}' + 模型 '{model_name}' 已保存到:\n{ENV_PATH}\n\n"
                                 "现在可以启动代理服务器了。")
         except Exception as e:
             messagebox.showerror("保存失败", str(e))
@@ -558,13 +571,13 @@ class ConfigToolGUI:
             dmodel = existing.get("DEFAULT_MODEL", "gemini-3.5-flash")
 
             proc = subprocess.Popen(
-                [sys.executable, "-u", server_script, port],
+                [sys.executable, "-u", server_script, str(port)],
                 cwd=SELF_DIR,
                 creationflags=subprocess.CREATE_NO_WINDOW,
             )
 
             self.status_var.set(f"✓ 服务器已启动 (PID: {proc.pid})")
-            models = existing.get("MODEL_NAMES", dmodel)
+            models = existing.get("PROFILES", dmodel)
             messagebox.showinfo("服务器已启动",
                                 f"代理服务器已在后台启动 (PID: {proc.pid})\n\n"
                                 f"访问地址: http://localhost:{port}\n\n"
