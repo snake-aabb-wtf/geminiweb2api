@@ -1,0 +1,24 @@
+# 敏感配置（账号鉴权令牌）
+.env
+
+# HAR 文件（包含完整请求/响应数据和认证信息）
+*.har
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+
+# 临时测试文件
+test_*.py
+analyze_*.py
+server_out.log
+server_log.txt
+crash.log
+crash_err.log
+stdout.log
+stderr.log
+gemini_proxy.log
+
+# 系统生成
+start_proxy.bat
