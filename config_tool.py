@@ -447,7 +447,7 @@ class ConfigToolGUI:
         # Auto-detect model family for name hint
         mf = info.get("model_family", 1)
         tm = info.get("thinking_mode", 1)
-        name_hint = {1: "gemini-3.5-flash", 6: "gemini-3.1-flash-lite"}.get(mf, f"model-family-{mf}")
+        name_hint = {1: "gemini-3.5-flash", 3: "gemini-3.1-pro", 6: "gemini-3.1-flash-lite"}.get(mf, f"model-family-{mf}")
         if tm == 2:
             name_hint += "-adv"
         self.model_name_var.set(name_hint)

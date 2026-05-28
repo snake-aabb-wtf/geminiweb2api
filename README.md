@@ -292,7 +292,7 @@ THINKING_MODE_gemini-3.5-flash-adv=2    # 进阶思考
 
 | 数组索引 | 含义 | 可选值 |
 |:--------:|:-----|:-------|
-| `[14]` | **模型家族** | `1` = Flash 系列 · `6` = Flash Lite 系列 |
+| `[14]` | **模型家族** | `1` = Flash · `3` = Pro · `6` = Flash Lite |
 | `[15]` | **思考模式** | `1` = 标准思考 · `2` = 进阶思考 / 扩展思考 |
 
 ### 推荐模型命名
@@ -301,6 +301,8 @@ THINKING_MODE_gemini-3.5-flash-adv=2    # 进阶思考
 |:---------|:---------|:-----------|
 | Flash | 标准 | `gemini-3.5-flash` |
 | Flash | 进阶 | `gemini-3.5-flash-adv` |
+| Pro | 标准 | `gemini-3.1-pro` |
+| Pro | 扩展 | `gemini-3.1-pro-ext` |
 | Flash Lite | 标准 | `gemini-3.1-flash-lite` |
 | Flash Lite | 进阶 | `gemini-3.1-flash-lite-adv` |
 
