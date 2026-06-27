@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>登录 — Gemini2API</title>
+<link rel="stylesheet" href="/static/style.css">
+<style>
+  .login-box { max-width: 420px; margin: 80px auto; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 32px; }
+  .login-box h1 { margin-bottom: 8px; font-size: 20px; }
+  .login-box p { color: var(--text-dim); font-size: 13px; margin-bottom: 16px; }
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="login-box">
+    <h1>✨ Gemini2API 登录</h1>
+    <p>请输入 ADMIN_KEY 访问管理面板。</p>
+    <form method="POST" action="/api/auth/web_login">
+      <div class="form-row">
+        <label for="key">ADMIN_KEY</label>
+        <input type="password" id="key" name="key" required autofocus>
+      </div>
+      <button type="submit" class="primary">登录</button>
+    </form>
+  </div>
+</div>
+</body>
+</html>

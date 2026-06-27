@@ -1,424 +1,219 @@
-<p align="center">
-  <img src="https://img.shields.io/badge/python-3.10%2B-blue?style=flat-square&logo=python" alt="Python">
-  <img src="https://img.shields.io/badge/license-Unlicense-green?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/status-stable-brightgreen?style=flat-square" alt="Status">
-  <img src="https://img.shields.io/badge/OpenAI-Compatible-f15b2a?style=flat-square&logo=openai" alt="OpenAI Compatible">
-</p>
+# gemini2api v1.0
 
-<h1 align="center">✨ Gemini2API</h1>
-<p align="center"><b>将 Google Gemini 网页版逆向为 OpenAI 兼容 API · 支持多模型切换</b></p>
+> 把 Google Gemini 网页版 API 包装成 OpenAI 兼容接口。
+> 通过浏览器 HAR 文件提取认证参数,启动一个本地代理服务器。
 
-<p align="center">
-只需从浏览器导出一个 <code>.har</code> 文件，即可自动提取认证参数，<br>
-启动一个支持多模型、多思考模式的 OpenAI 兼容代理服务器。
-</p>
-
-<br>
+**v1.0 是一次较大重构**:全面修复了 v0.3 的安全 / 并发 / 正确性问题,新增鉴权、限流、真正流式、Token 统计、多模态、Function calling、WebUI 重做、51 个测试。详见 [CHANGELOG.md](CHANGELOG.md)。
 
 ---
 
-## 📋 目录
+## ✨ v1.0 新增能力
 
-- [✨ 特性](#-特性)
-- [🔧 原理](#-原理)
-- [🚀 快速开始](#-快速开始)
-  - [前置条件](#前置条件)
-  - [1. 捕获 HAR 文件](#1-捕获-har-文件)
-  - [2. 运行配置工具](#2-运行配置工具)
-  - [3. 一键启动](#3-一键启动)
-  - [4. 使用 API](#4-使用-api)
-- [📁 项目结构](#-项目结构)
-- [⚙️ 配置说明](#️-配置说明)
-- [🧠 模型与思考模式](#-模型与思考模式)
-- [🔄 认证参数过期处理](#-认证参数过期处理)
-- [⚠️ 注意事项](#️-注意事项)
-  - [已知限制](#已知限制)
-  - [常见问题](#常见问题)
-- [📄 License](#-license)
-- [⚖️ 免责协议](#️-免责协议)
-
----
-
-## ✨ 特性
-
-| 特性 | 支持 | 说明 |
-|:-----|:----:|:-----|
-| OpenAI 兼容 API | ✅ | `/v1/chat/completions` + `/v1/models` |
-| 多模型切换 | ✅ | 通过 `model` 字段任意切换 |
-| 思考模式切换 | ✅ | 标准 / 进阶思考 |
-| GUI 配置工具 | ✅ | 图形化操作，无需手写配置 |
-| 多 Profile 配置 | ✅ | 各模型独立凭证，互不干扰 |
-| 一键启动 | ✅ | `start.bat` 双击即用 |
-| 流式输出 | ✅ | SSE 流式支持 |
-| 健康检查 | ✅ | `/health` 端点 |
-
----
-
-## 🔧 原理
-
-```mermaid
-flowchart TD
-    A["🌐 浏览器 F12 Network<br>导出 .har 文件"] --> B
-    B["🖥️ config_tool.py<br>GUI 配置工具"] --> C
-    C["📄 .env 配置文件<br>多 Profile 存储"] --> D
-    D["🚀 server.py<br>FastAPI 代理服务器"] --> E
-    E["📡 /v1/chat/completions<br>OpenAI 兼容接口"]
-    D --> F["📋 /v1/models<br>列出可用模型"]
-    D --> G["❤️ /health<br>健康检查"]
-    E --> H["🧩 adapter.py<br>Gemini API 适配器"]
-    H --> I["🎯 目标:<br>gemini.google.com"]
-```
-
-> **一句话原理**：配置工具从 HAR 提取认证参数 → 存入 `.env` → 代理服务器读取 `.env` 并转发请求到 Gemini，同时将响应转换为 OpenAI 格式。
+| 类别 | 能力 |
+| --- | --- |
+| **安全** | Bearer Token 鉴权中间件、Admin Cookie 登录、CORS 收紧、WebUI XSS 修复 |
+| **稳定性** | 账号池 `asyncio.Lock`、每账号并发/速率双限流、自动重试 + 指数退避、`.env` 热加载 |
+| **协议** | 真正 SSE 增量流式、Token usage 解析、多模态图片、Function calling 透传 |
+| **运维** | 结构化 logging(滚动文件)、SSE 实时日志页、账号池 `.env` 持久化 |
+| **测试** | 51 个 pytest 单元/集成测试,覆盖协议、池、鉴权、限流、HAR、API |
+| **UI** | 全新深色 SPA(原生 JS+HTMX),5s 自动刷新,登录页+账号添加表单 |
 
 ---
 
 ## 🚀 快速开始
 
-### 前置条件
-
-- [x] Python 3.10+
-- [x] Google 账号（已登录 Gemini）
-- [x] Chrome / Edge 浏览器
+### 1. 安装依赖
 
 ```bash
-pip install fastapi uvicorn httpx python-dotenv pydantic
+pip install -r requirements.txt
 ```
 
----
+要求 Python 3.10+。Windows 用户直接双击 `start.bat`。
 
-### 1. 捕获 HAR 文件
+### 2. 导出 HAR 并生成配置
 
-> [!TIP]
-> 每个模型需要**单独捕获一次** HAR 文件。例如 3.5 Flash 一次、3.1 Flash Lite 一次。
+在浏览器登录 [gemini.google.com](https://gemini.google.com),打开 DevTools → Network 面板,刷新页面,右键任意 `StreamGenerate` 请求 → "Save all as HAR with content"。
 
-<details>
-<summary><b>📸 详细步骤（点击展开）</b></summary>
-
-1. 打开 Chrome，按 **`F12`** 进入 DevTools
-2. 切换到 **Network** 面板
-3. ✅ 勾选 **Preserve log**（保留日志）
-4. 访问 [https://gemini.google.com](https://gemini.google.com)，**确保已登录**
-5. 在 Gemini UI 中选择你想要使用的模型（如 Gemini 3.5 Flash）
-6. 发送一条聊天消息，等待 AI 回复完成
-7. 在 Network 面板中 **右键任意请求**
-8. 选择 **Save all as HAR with content**
-9. 保存为 `.har` 文件
-
-</details>
-
----
-
-### 2. 运行配置工具
+然后运行 GUI:
 
 ```bash
 python config_tool.py
 ```
 
-| 步骤 | 操作 | 说明 |
-|:----:|:-----|:-----|
-| ① | 点击 **浏览...** | 选择上一步保存的 `.har` 文件 |
-| ② | 填写 **模型名** | 如 `gemini-3.5-flash` |
-| ③ | 点击 **解析** | 自动提取认证参数 + JSPB 模型信息 |
-| ④ | 点击 **保存到 .env** | 写入对应 Profile |
-| ⑤ | 切换 HAR 文件 | 换一个模型，重复 ①~④ |
+* 选择 HAR → 点击"解析" → 输入账号名 → 点击"保存到 .env"。
+* 可选:点击"启动代理服务器"实时查看日志。
 
-> [!NOTE]
-> 工具会自动识别 `model_family` 和 `thinking_mode`，并提示建议的模型名。
+### 3. 启动服务
+
+```bash
+python server.py          # 默认 0.0.0.0:1800
+python server.py 19000    # 自定义端口
+```
+
+启动后:
+
+* 浏览器打开 [http://localhost:1800/](http://localhost:1800/) → 登录管理面板(默认鉴权关闭时直接进入)。
+* 客户端把 base URL 设为 `http://localhost:1800/v1`,API key 与 `ADMIN_KEY` 相同(留空则不校验)。
 
 ---
 
-### 3. 一键启动
+## 🔐 鉴权
 
-```bash
-start.bat
-```
-
-或手动启动：
-
-```bash
-python server.py 1800
-```
-
-服务器默认运行在 **`http://localhost:1800`**。
-
-<details>
-<summary><b>验证服务器是否正常运行</b></summary>
-
-```bash
-curl http://localhost:1800/health
-# 预期响应: {"status":"ok","model":"gemini-3.5-flash","profiles":["gemini-3.5-flash",...]}
-```
-
-```bash
-curl http://localhost:1800/v1/models
-# 预期响应: {"object":"list","data":[{"id":"gemini-3.5-flash",...}]}
-```
-
-</details>
-
----
-
-### 4. 使用 API
-
-#### Python (OpenAI SDK)
-
-```python
-from openai import OpenAI
-
-client = OpenAI(
-    base_url="http://localhost:1800/v1",
-    api_key="sk-web2api-placeholder",  # 任意值即可
-)
-
-# 列出可用模型
-models = client.models.list()
-print([m.id for m in models.data])
-# ➜ ['gemini-3.5-flash', 'gemini-3.5-flash-adv', 'gemini-3.1-flash-lite', ...]
-
-# 3.5 Flash 标准思考
-resp = client.chat.completions.create(
-    model="gemini-3.5-flash",
-    messages=[{"role": "user", "content": "Hello"}],
-)
-print(resp.choices[0].message.content)
-
-# 3.5 Flash 进阶思考（只需换 model 名）
-resp = client.chat.completions.create(
-    model="gemini-3.5-flash-adv",
-    messages=[{"role": "user", "content": "Hello"}],
-)
-```
-
-#### cURL
-
-```bash
-# 3.5 Flash 标准思考
-curl -s http://localhost:1800/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model":"gemini-3.5-flash","messages":[{"role":"user","content":"Hello"}]}'
-
-# 3.5 Flash 进阶思考
-curl -s http://localhost:1800/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model":"gemini-3.5-flash-adv","messages":[{"role":"user","content":"Hello"}]}'
-
-# 3.1 Flash Lite 标准思考
-curl -s http://localhost:1800/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model":"gemini-3.1-flash-lite","messages":[{"role":"user","content":"Hello"}]}'
-```
-
-#### Claude Code
-
-```bash
-set OPENAI_API_BASE=http://localhost:1800/v1
-set OPENAI_API_KEY=sk-web2api-placeholder
-claude
-```
-
----
-
-## 📁 项目结构
-
-```
-Gemini2API/
-├── 🖥️  config_tool.py      # GUI 配置工具（选择 HAR → 解析 → 保存 .env）
-├── 🚀  server.py           # FastAPI 代理服务器
-├── 🧩  adapter.py          # Gemini API 适配器（多 Profile 架构）
-├── 📄  har_parser.py       # HAR 文件解析器（含 JSPB 提取）
-├── 🏁  start.bat           # 一键启动脚本
-├── 🔒  .env                # 配置文件（自动生成，含敏感信息）
-├── 📋  .env.example        # 配置模板
-├── 📖  README.md           # 本文件
-└── 📜  LICENSE             # Unlicense 公有领域
-```
-
----
-
-## ⚙️ 配置说明
-
-`.env` 文件分为 **服务器配置** 和 **多 Profile** 两段：
+`.env` 中:
 
 ```ini
-# ============================================
-# 服务器配置
-# ============================================
-HOST=0.0.0.0
-PORT=1800
-API_KEY=sk-web2api-placeholder
-MODEL_NAMES=gemini-3.5-flash,gemini-3.5-flash-adv,gemini-3.1-flash-lite
-DEFAULT_MODEL=gemini-3.5-flash
-
-# ============================================
-# Profile: gemini-3.5-flash
-# ============================================
-MODEL_FAMILY_gemini-3.5-flash=1        # 1=Flash, 6=Flash Lite
-THINKING_MODE_gemini-3.5-flash=1       # 1=标准, 2=进阶
-F_SID_gemini-3.5-flash=xxx
-AT_gemini-3.5-flash=xxx
-SN_PARAM_gemini-3.5-flash=xxx
-BL_PARAM_gemini-3.5-flash=xxx
-HL_gemini-3.5-flash=zh-CN
-UUID_gemini-3.5-flash=xxx
-HASH_gemini-3.5-flash=xxx
-
-# ============================================
-# Profile: gemini-3.5-flash-adv
-# ============================================
-MODEL_FAMILY_gemini-3.5-flash-adv=1
-THINKING_MODE_gemini-3.5-flash-adv=2    # 进阶思考
-...
+# 设为任意非占位值即启用
+API_KEY=sk-my-secret
+ADMIN_KEY=sk-my-admin-secret
 ```
 
-| 字段 | 格式 | 说明 |
-|:-----|:-----|:-----|
-| `MODEL_FAMILY_<name>` | `1` / `6` | 1=Flash, 6=Flash Lite |
-| `THINKING_MODE_<name>` | `1` / `2` | 1=标准, 2=进阶 |
-| `F_SID_<name>` | 数字串 | 会话 ID |
-| `AT_<name>` | 令牌串 | 认证令牌 |
-| `SN_PARAM_<name>` | 加密串 | SN 令牌 |
-| `UUID_<name>` | UUID | 会话 UUID（JSPB） |
-| `HASH_<name>` | 哈希串 | 请求哈希（JSPB） |
+* `API_KEY` 校验 `/v1/*` 端点(OpenAI 客户端兼容)。
+* `ADMIN_KEY` 校验 `/api/*` 和 WebUI 页面(浏览器登录页 `/webui/login`)。
+* 留空 / 设为 `sk-web2api-placeholder` / `off` / `disabled` 即禁用,仅供本地开发。
 
-> [!IMPORTANT]
-> 每个 Profile 使用 `_模型名` 后缀区分，互不干扰。配置工具只更新对应 Profile，不动其他 Profile。
+**生产环境务必设置。** 服务启动时会在日志和 dashboard 顶部显示鉴权状态。
 
 ---
 
-## 🧠 模型与思考模式
+## ⚙️ 关键配置
 
-### JSPB 字段释义
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `HOST` | `0.0.0.0` | 监听地址 |
+| `PORT` | `1800` | 监听端口 |
+| `API_KEY` | placeholder | `/v1/*` 鉴权 |
+| `ADMIN_KEY` | 同 `API_KEY` | WebUI + `/api/*` 鉴权 |
+| `CORS_ORIGINS` | (空) | 逗号分隔;留空不启用 CORS |
+| `ROTATION_STRATEGY` | `least-recently-used` | `round-robin` / `random` / `first` |
+| `MAX_ERRORS_BEFORE_DISABLE` | `3` | 账号连续失败 N 次后自动停用 |
+| `GLOBAL_RATE_LIMIT_RPM` | `0` | 全局每 IP 每分钟限流;0=关闭 |
+| `LOG_LEVEL` | `INFO` | `DEBUG` / `INFO` / `WARNING` / `ERROR` |
+| `LOG_FILE` | `gemini_proxy.log` | 日志文件,空字符串禁用 |
+| `PERSIST_ACCOUNTS` | `1` | WebUI 修改是否自动写回 .env |
+| `PROFILES` | (空) | 逗号分隔的模型 profile 名 |
+| `MODEL_FAMILY_<name>` | `1` | 1=Flash, 3=Pro, 6=Flash Lite |
+| `THINKING_MODE_<name>` | `1` | 1=标准, 2=进阶 |
+| `DEFAULT_MODEL` | 第一个 profile | `model` 字段缺省值 |
 
-| 数组索引 | 含义 | 可选值 |
-|:--------:|:-----|:-------|
-| `[14]` | **模型家族** | `1` = Flash · `3` = Pro · `6` = Flash Lite |
-| `[15]` | **思考模式** | `1` = 标准思考 · `2` = 进阶思考 / 扩展思考 |
+每账号:
 
-### 推荐模型命名
-
-| 模型家族 | 思考模式 | 推荐模型名 |
-|:---------|:---------|:-----------|
-| Flash | 标准 | `gemini-3.5-flash` |
-| Flash | 进阶 | `gemini-3.5-flash-adv` |
-| Pro | 标准 | `gemini-3.1-pro` |
-| Pro | 扩展 | `gemini-3.1-pro-ext` |
-| Flash Lite | 标准 | `gemini-3.1-flash-lite` |
-| Flash Lite | 进阶 | `gemini-3.1-flash-lite-adv` |
-
-> [!TIP]
-> 模型名是自由的——你想叫什么就叫什么，只要 `.env` 中有对应 Profile 即可。
-
----
-
-## 🔄 认证参数过期处理
-
-| 参数 | 有效期 | 说明 |
-|:-----|:------|:-----|
-| `at` | ⏳ 数小时 | 会话级别，过期最快 |
-| `f.sid` | 📅 数天 | 会话 ID |
-| `sn_param` | 🔄 每次响应刷新 | 加密令牌，旧值仍可用一段时间 |
-| `bl` | 📆 版本更新时 | 构建版本号 |
-
-**过期处理流程：**
-
-```
-浏览器 F12 → 保存 HAR → 运行 config_tool.py → 
-填入相同模型名 → 点击保存 → 重启服务器
-```
-
-整个过程无需手动编辑 `.env`。
+| 变量 | 说明 |
+| --- | --- |
+| `ACCOUNT_<name>_F_SID` | 会话 ID |
+| `ACCOUNT_<name>_AT` | 认证令牌(数小时有效) |
+| `ACCOUNT_<name>_SN_PARAM` | SN 加密令牌(每次响应刷新) |
+| `ACCOUNT_<name>_BL_PARAM` | 构建版本(版本更新时变) |
+| `ACCOUNT_<name>_HL` | 语言,默认 `zh-CN` |
+| `ACCOUNT_<name>_UUID` | JSPB 索引 16 |
+| `ACCOUNT_<name>_HASH` | JSPB 索引 4 |
+| `ACCOUNT_<name>_ENABLED` | `true` / `false` |
+| `ACCOUNT_<name>_MODELS` | 绑定的 profile 列表,逗号分隔 |
+| `ACCOUNT_<name>_RATE_LIMIT_RPM` | 单账号每分钟限流,默认 60 |
+| `ACCOUNT_<name>_MAX_CONCURRENT` | 单账号并发上限,默认 4 |
+| `ACCOUNT_<name>_HEADER_<name>` | 自定义请求头(原 HAR 复制) |
 
 ---
 
-## ⚠️ 注意事项
+## 📡 API
 
-### 已知限制
+### OpenAI 兼容
 
-- [ ] 仅支持**文本对话**，不支持多模态（图片/文件）
-- [ ] 需要在 Gemini 网页端**选择好模型后**再捕获 HAR
-- [ ] 每个模型有**独立的认证凭证**，不可混用
-- [ ] 不支持工具调用（function calling）
+* `POST /v1/chat/completions` — 完全兼容 OpenAI 协议
+  * `model`: profile 名
+  * `messages`: OpenAI 格式
+  * `stream`: `true` / `false`
+  * `temperature`, `max_tokens`, `top_p`: 透传
+  * `tools`, `tool_choice`: function calling
+  * `messages[].content`: 字符串 或 `[{"type": "text"|"image_url", ...}]`
+* `GET /v1/models` — 模型列表
 
-### 常见问题
+### 管理 API(`/api/*`,需要 `ADMIN_KEY`)
 
-<details>
-<summary><b>Q: 返回 502 Bad Gateway</b></summary>
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/api/stats` | 池统计 + 账号详细状态 |
+| GET | `/api/accounts` | 账号列表 |
+| POST | `/api/accounts` | 创建账号(JSON) |
+| PATCH | `/api/accounts/{name}` | 修改 enabled/bound/限流 |
+| DELETE | `/api/accounts/{name}` | 删除账号 |
+| PUT | `/api/accounts/{name}/toggle` | 快速启停(legacy) |
+| GET | `/api/profiles` | 模型 profile 列表 |
+| POST | `/api/accounts/from-har` | 表单上传 HAR,返回提取的凭证(不直接入库) |
+| GET | `/api/events/stream` | **SSE** 实时日志推送 |
+| POST | `/api/auth/web_login` | 浏览器登录,设置 admin cookie |
+| POST | `/api/auth/logout` | 清除 cookie |
 
-认证参数过期。重新捕获 HAR 文件并用配置工具更新。
-</details>
+### WebUI
 
-<details>
-<summary><b>Q: 如何添加新模型？</b></summary>
+* `/` — 仪表盘(8 张统计卡 + 自动 5s 刷新)
+* `/webui/accounts` — 账号管理(表格 + 增删改 + HAR 导入)
+* `/webui/logs` — 实时日志(SSE)
+* `/webui/login` — 登录页
 
-1. 在 Gemini 网页切换到该模型 → 发送消息 → 导出 HAR
-2. 运行 `config_tool.py` → 选择 HAR → 填入模型名 → 保存
-</details>
+---
 
-<details>
-<summary><b>Q: 如何更改端口？</b></summary>
-
-直接编辑 `.env` 中的 `PORT=` 行，重启服务器即可。
-</details>
-
-<details>
-<summary><b>Q: 服务器启动报错端口被占用？</b></summary>
+## 🧪 测试
 
 ```bash
-# 查看谁占了端口
-netstat -ano | findstr ":1800"
-# 杀掉占用进程（替换 PID）
-taskkill /PID <PID> /F
-# 或改到其他端口
-# 编辑 .env 中的 PORT=1801
+pip install -r requirements.txt
+python -m pytest tests/ -v
 ```
-</details>
 
-<details>
-<summary><b>Q: 支持 Claude Code / Cursor / Continue 吗？</b></summary>
+覆盖范围:
 
-支持。只需将 OpenAI API base 指向本代理：
-
-| 工具 | 配置 |
-|:-----|:-----|
-| Claude Code | `OPENAI_API_BASE=http://localhost:1800/v1` |
-| Cursor | 设置 → OpenAI Base URL |
-| Continue | `config.json` 中配置 |
-</details>
+* `test_build_jspb_header.py` — 协议头 17 元素形状
+* `test_build_request_body.py` — 双层 JSON 编码 + padding 81
+* `test_parse_response.py` — 主答案/思考分离/工具调用/Token 解析
+* `test_account_pool.py` — LRU/random/限流/并发/in-flight/持久化
+* `test_auth.py` — 占位禁用/启用/缺失/错误/正确 key
+* `test_rate_limit.py` — 桶容量/独立 key/forwarded-for
+* `test_har_parser.py` — URL/JSPB/body 三路字段提取
+* `test_api.py` — `/health`、`/v1/models`、鉴权 + 快乐路径(用 fake `send_request` 注入)
 
 ---
 
-## 📄 License
+## ⚠️ 已知限制
 
-```
-This is free and unencumbered software released into the public domain.
-```
-
-**Unlicense** — 公有领域。详见 [LICENSE](./LICENSE)。
-
----
-
-## ⚖️ 免责协议
-
-> [!CAUTION]
-> 本软件仅供 **学习研究和技术交流** 使用。使用本软件时，您需自行承担一切法律责任。
-
-| 条款 | 说明 |
-|:-----|:------|
-| 🛡️ **账号风险** | 使用本软件可能导致 Google 账号被限制或封禁，由使用者自行承担 |
-| ⚖️ **合规责任** | 使用者应确保使用方式符合目标网站的服务条款及当地法律法规 |
-| 🚫 **用途限制** | 禁止将本软件用于任何违反法律法规、侵犯他人权益或商业牟利的用途 |
-| ❌ **无担保** | 本软件按"原样"提供，不提供任何明示或暗示的担保 |
-
-**通过使用本软件，即表示您已阅读、理解并同意以上条款。如不同意，请立即停止使用并删除本软件。**
+* **协议风险**:基于逆向的 `/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate` 端点,Google 改版可能失效。
+* **多轮对话**:仅取最后一条 user message;无 conversation memory。
+* **Function calling**:Gemini Web 不保证工具调用可用;实现是 best-effort。
+* **多模态图片**:走 `UploadFile` 端点,失败时降级为"忽略图片 + 仅文本"。
+* **Cookie/凭证有效期**:`at` 数小时、`f.sid` 数天、`sn_param` 每次响应更新。失效后用 HAR 重新提取。
 
 ---
 
-<p align="center">
-  <sub>Made with ❤️ for research purposes</sub>
-  <br>
-  <sub>
-    <a href="https://github.com/snake-aabb-wtf/geminiweb2api">GitHub</a> ·
-    <a href="#-目录">回到顶部 ↑</a>
-  </sub>
-</p>
+## 🗂 项目结构
+
+```
+geminiweb2api/
+├── server.py              # FastAPI 入口、路由、鉴权、流式处理
+├── adapter.py             # Gemini 协议适配(JSPB 头、双层 body、响应解析、限流)
+├── account_pool.py        # 账号池(线程安全)、持久化、HAR 解析入口
+├── auth.py                # Bearer/admin 鉴权
+├── rate_limit.py          # 令牌桶限流
+├── logger.py              # 结构化日志
+├── har_parser.py          # HAR → 凭证提取
+├── config_tool.py         # Tkinter GUI(.env 生成 + 子进程管理)
+├── start.bat              # Windows 启动脚本
+├── requirements.txt       # pin 版本依赖
+├── .env.example           # 配置模板
+├── pytest.ini             # pytest 配置
+├── CHANGELOG.md           # 版本变更日志
+├── templates/             # WebUI 模板
+│   ├── dashboard.html
+│   ├── accounts.html
+│   ├── logs.html
+│   └── login.html
+├── static/                # 静态资源
+│   ├── style.css
+│   └── app.js
+└── tests/                 # 单元 + 集成测试
+    ├── conftest.py
+    └── test_*.py (8 个文件,51 用例)
+```
+
+---
+
+## 📜 License
+
+Unlicense — public domain.

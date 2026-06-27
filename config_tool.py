@@ -1,592 +1,302 @@
-import json
+"""Tkinter GUI for generating ``.env`` from a HAR file.
+
+v1.0 changes
+-------------
+* Uses the shared :mod:`har_parser` instead of the previous in-file
+  duplicate. If the new module ever drifts the GUI keeps working as long
+  as ``parse_har()`` returns a ``GeminiHarAnalysis``.
+* The "Start proxy" button now captures ``stdout``/``stderr`` and
+  streams it into a Tkinter Text widget instead of silently
+  detaching the process.
+* Pre-flight port check via a transient socket — gives a friendly
+  error before the user wastes time waiting for a connection-refused.
+* Logging is routed through the shared :mod:`logger` so the GUI and
+  the server emit consistent log lines.
+
+Run with: ``python config_tool.py``
+"""
+from __future__ import annotations
+
 import os
 import re
+import socket
+import subprocess
+import sys
+import threading
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
-from urllib.parse import urlparse, parse_qs, unquote
+from pathlib import Path
+from tkinter import filedialog, messagebox, scrolledtext, ttk
 
-SELF_DIR = os.path.dirname(os.path.abspath(__file__))
-ENV_PATH = os.path.join(SELF_DIR, ".env")
+from dotenv import load_dotenv
+from har_parser import GeminiHarAnalysis, parse_har
+from logger import get_logger
 
-FIELD_LABELS = {
-    "base_url": "目标地址",
-    "chat_endpoint": "聊天端点",
-    "cookies": "Cookie",
-    "auth_header": "Authorization",
-    "auth_type": "认证类型",
-    "is_streaming": "流式支持",
-    "has_websocket": "WebSocket",
-    "has_pow": "PoW 挑战",
-    "bl_param": "bl 参数",
-    "f_sid": "f.sid",
-    "hl": "语言",
-    "at": "at 令牌",
-    "sn_param": "sn 参数",
-    "supported_params": "支持的参数",
-    "content_field_path": "内容字段路径",
-    "header_count": "请求头数量",
-}
+log = get_logger("config_tool")
 
+APP_TITLE = "Gemini2API 配置工具 v1.0"
+ENV_FILENAME = ".env"
+ENV_EXAMPLE_FILENAME = ".env.example"
 
-def parse_har_file(har_path: str) -> dict:
-    with open(har_path, "r", encoding="utf-8") as f:
-        har = json.load(f)
-    entries = har.get("log", {}).get("entries", [])
+# ── .env helpers ─────────────────────────────────────────────────────
 
-    info = {"_errors": [], "_warnings": []}
-
-    chat_entry = None
-    chat_idx = -1
-    for idx, entry in enumerate(entries):
-        url = entry.get("request", {}).get("url", "")
-        if "StreamGenerate" in url:
-            chat_entry = entry
-            chat_idx = idx
-            break
-
-    if not chat_entry:
-        info["_errors"].append("未找到 Gemini StreamGenerate 端点，将使用第一个 POST 请求")
-        for idx, entry in enumerate(entries):
-            if entry.get("request", {}).get("method") == "POST":
-                chat_entry = entry
-                chat_idx = idx
-                break
-
-    if not chat_entry:
-        info["_errors"].append("HAR 文件中没有 POST 请求")
-        return info
-
-    req = chat_entry.get("request", {})
-    resp = chat_entry.get("response", {})
-    url = req.get("url", "")
-    parsed = urlparse(url)
-
-    info["base_url"] = f"{parsed.scheme}://{parsed.netloc}"
-    info["chat_endpoint"] = parsed.path
-    info["har_path"] = har_path
-
-    qs = parse_qs(parsed.query)
-    info["bl_param"] = qs.get("bl", [""])[0]
-    info["f_sid"] = qs.get("f.sid", [""])[0]
-    info["hl"] = qs.get("hl", ["zh-CN"])[0]
-
-    for h in req.get("headers", []):
-        if h.get("name", "").lower() == "cookie":
-            info["cookies"] = h.get("value", "")
-        if h.get("name", "").lower() == "authorization":
-            info["auth_header"] = h.get("value", "")
-
-    header_list = req.get("headers", [])
-    info["header_count"] = len(header_list)
-
-    post_data = req.get("postData", {})
-    body_text = post_data.get("text", "")
-
-    info["at"] = ""
-    info["sn_param"] = ""
-    if body_text:
-        at_match = re.search(r"[?&]at=([^&]+)", url)
-        if at_match:
-            info["at"] = at_match.group(1)
-        else:
-            at_match = re.search(r"&at=([^&]+)", body_text)
-            if at_match:
-                info["at"] = at_match.group(1)
-
-        if "f.req=" in body_text:
-            parsed_body = parse_qs(body_text)
-            freq_enc = parsed_body.get("f.req", [""])[0]
-            freq_dec = unquote(freq_enc)
-            try:
-                freq_json = json.loads(freq_dec)
-                inner_raw = freq_json[1]
-                inner = json.loads(inner_raw)
-                if len(inner) > 3:
-                    sn = inner[3]
-                    if isinstance(sn, str) and len(sn) > 10:
-                        info["sn_param"] = sn
-                if isinstance(inner[0], list) and len(inner[0]) > 1:
-                    conv_id = inner[0][1]
-                    if conv_id is not None:
-                        info["_first_conv_id"] = str(conv_id)
-            except (json.JSONDecodeError, IndexError, TypeError) as e:
-                info["_warnings"].append(f"解析 f.req 失败: {e}")
-
-    resp_text = resp.get("content", {}).get("text", "")
-    info["is_streaming"] = False
-    for h in resp.get("headers", []):
-        if h.get("name", "").lower() == "content-type":
-            if "text/event-stream" in h.get("value", ""):
-                info["is_streaming"] = True
-
-    if resp_text and resp_text.startswith(")]}'"):
-        info["_has_data"] = True
-        lines = resp_text.strip().split("\n")
-        for i in range(0, len(lines), 2):
-            if i + 1 >= len(lines):
-                continue
-            dl = lines[i + 1].strip()
-            if not dl:
-                continue
-            try:
-                outer = json.loads(dl)
-                if isinstance(outer, list) and len(outer) > 0:
-                    wrb = outer[0]
-                    if isinstance(wrb, list) and len(wrb) >= 3 and isinstance(wrb[2], str):
-                        inner_data = json.loads(wrb[2])
-                        if isinstance(inner_data, list) and len(inner_data) > 1:
-                            id_pair = inner_data[1]
-                            if isinstance(id_pair, list) and len(id_pair) >= 2:
-                                info["_conv_id"] = id_pair[0]
-                                info["_resp_id"] = id_pair[1]
-                        if len(inner_data) > 2 and isinstance(inner_data[2], dict):
-                            val26 = inner_data[2].get("26")
-                            if isinstance(val26, str) and val26:
-                                info["_token26"] = val26
-                        if len(inner_data) > 4 and isinstance(inner_data[4], list):
-                            for item in inner_data[4]:
-                                if isinstance(item, list) and len(item) >= 2:
-                                    rc_id = item[0]
-                                    if isinstance(rc_id, str) and rc_id.startswith("rc_"):
-                                        info["_rc_id"] = rc_id
-                                    cp = item[1]
-                                    if isinstance(cp, list) and cp:
-                                        txt = cp[0]
-                                        if isinstance(txt, str) and len(txt) > 5:
-                                            info["_response_preview"] = txt[:200]
-                                            break
-            except (json.JSONDecodeError, IndexError, TypeError):
-                continue
-
-    info["has_websocket"] = False
-    for entry in entries:
-        if entry.get("response", {}).get("status") == 101:
-            info["has_websocket"] = True
-            break
-
-    info["has_pow"] = False
-    for entry in entries:
-        path = urlparse(entry.get("request", {}).get("url", "")).path
-        if re.search(r"(challenge|pow|turnstile)", path, re.I):
-            info["has_pow"] = True
-            break
-
-    info["auth_type"] = "none"
-    if info.get("auth_header"):
-        info["auth_type"] = "oauth"
-    if info.get("has_pow"):
-        info["auth_type"] = "pow"
-    if info.get("cookies"):
-        if not info.get("auth_header"):
-            info["auth_type"] = "cookie"
-
-    # Parse JSPB header for model selection fields
-    for h in req.get("headers", []):
-        if h.get("name", "").lower() == "x-goog-ext-525001261-jspb":
-            try:
-                jspb = json.loads(h.get("value", "[]"))
-                if isinstance(jspb, list):
-                    if len(jspb) > 14 and isinstance(jspb[14], int):
-                        info["model_family"] = jspb[14]
-                    if len(jspb) > 15 and isinstance(jspb[15], int):
-                        info["thinking_mode"] = jspb[15]
-                    if len(jspb) > 16 and isinstance(jspb[16], str):
-                        info["session_uuid"] = jspb[16]
-                    if len(jspb) > 4 and isinstance(jspb[4], str):
-                        info["request_hash"] = jspb[4]
-            except (json.JSONDecodeError, TypeError):
-                pass
-
-    return info
-
-
-SERVER_FIELDS = {"HOST", "PORT", "API_KEY", "ROTATION_STRATEGY", "MAX_ERRORS_BEFORE_DISABLE", "PROFILES", "DEFAULT_MODEL"}
-
-
-def read_existing_env() -> dict:
-    result = {}
-    if not os.path.exists(ENV_PATH):
-        return result
-    with open(ENV_PATH, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            if "=" in line:
-                k, v = line.split("=", 1)
-                result[k.strip()] = v.strip()
-    return result
-
-
-def update_env_with_profile(auth_info: dict, model_name: str, account_name: str) -> str:
-    existing = read_existing_env()
-    lines = []
-
-    # Server config
-    defaults = {"HOST": "0.0.0.0", "PORT": "1800", "API_KEY": "sk-web2api-placeholder",
-                "ROTATION_STRATEGY": "least-recently-used", "MAX_ERRORS_BEFORE_DISABLE": "3"}
-    for f in ("HOST", "PORT", "API_KEY", "ROTATION_STRATEGY", "MAX_ERRORS_BEFORE_DISABLE"):
-        val = existing.get(f, defaults.get(f, ""))
-        if val:
-            lines.append(f"{f}={val}")
-
-    mf = auth_info.get("model_family", 1)
-    tm = auth_info.get("thinking_mode", 1)
-
-    # PROFILES list — add model if new
-    existing_profiles = set()
-    raw = existing.get("PROFILES", "")
-    if raw:
-        existing_profiles = set(n.strip() for n in raw.split(",") if n.strip())
-    existing_profiles.add(model_name)
-    lines.append(f"PROFILES={','.join(sorted(existing_profiles))}")
-    lines.append(f"DEFAULT_MODEL={existing.get('DEFAULT_MODEL', model_name)}")
-    lines.append("")
-
-    # Profile config (model_family + thinking_mode)
-    lines.append(f"# Profile: {model_name}  (family={mf}, thinking={tm})")
-    lines.append(f"MODEL_FAMILY_{model_name}={mf}")
-    lines.append(f"THINKING_MODE_{model_name}={tm}")
-    lines.append("")
-
-    # Account entry
-    lines.append(f"# Account: {account_name}")
-    lines.append(f"ACCOUNT_{account_name}_F_SID={auth_info.get('f_sid', '')}")
-    lines.append(f"ACCOUNT_{account_name}_AT={auth_info.get('at', '')}")
-    lines.append(f"ACCOUNT_{account_name}_SN_PARAM={auth_info.get('sn_param', '')}")
-    lines.append(f"ACCOUNT_{account_name}_BL_PARAM={auth_info.get('bl_param', '')}")
-    lines.append(f"ACCOUNT_{account_name}_HL={auth_info.get('hl', 'zh-CN')}")
-    lines.append(f"ACCOUNT_{account_name}_UUID={auth_info.get('session_uuid', '')}")
-    lines.append(f"ACCOUNT_{account_name}_HASH={auth_info.get('request_hash', '')}")
-    lines.append(f"ACCOUNT_{account_name}_ENABLED=true")
-    lines.append(f"ACCOUNT_{account_name}_MODELS={model_name}")
-    lines.append("")
-
-    # Preserve other non-matching entries
-    skip_prefixes = {"HOST", "PORT", "API_KEY", "ROTATION_STRATEGY", "MAX_ERRORS_BEFORE_DISABLE",
-                     "PROFILES", "DEFAULT_MODEL"}
-    for k, v in existing.items():
-        if k in skip_prefixes:
+def read_existing_env(path: Path) -> list[tuple[str, str]]:
+    """Return ``[(key, value), ...]`` for every ``KEY=VALUE`` line."""
+    if not path.exists():
+        return []
+    out: list[tuple[str, str]] = []
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
             continue
-        if k.startswith("MODEL_FAMILY_") or k.startswith("THINKING_MODE_"):
-            if k.endswith(f"_{model_name}"):
-                continue
-        if k.startswith("ACCOUNT_"):
+        m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$", line)
+        if m:
+            out.append((m.group(1), m.group(2)))
+    return out
+
+
+def _suggest_model_name(family: int, thinking: int) -> str:
+    family_part = {1: "gemini-3.5-flash", 3: "gemini-3.1-pro", 6: "gemini-3.1-flash-lite"}.get(family, "gemini-custom")
+    suffix = "-adv" if thinking == 2 else ""
+    return f"{family_part}{suffix}"
+
+
+def build_env_lines(analysis: GeminiHarAnalysis, account_name: str, model_name: str) -> list[str]:
+    """Compose the new ``.env`` content, preserving non-account keys."""
+    here = Path(__file__).parent
+    existing = read_existing_env(here / ENV_FILENAME)
+
+    # Filter out ACCOUNT_* lines belonging to the account we're updating,
+    # so we end up with one consolidated block.
+    keep: list[tuple[str, str]] = []
+    prefix = f"ACCOUNT_{account_name}_"
+    for k, v in existing:
+        if k.startswith(prefix):
             continue
-        if v:
-            lines.append(f"{k}={v}")
+        keep.append((k, v))
 
-    return "# ============================================\n" \
-           "# 服务器配置\n" \
-           "# ============================================\n" + \
-           "\n".join(lines) + "\n"
+    # Ensure PROFILES / DEFAULT_MODEL include the new model.
+    profiles_kv = dict(keep)
+    profiles = [p.strip() for p in profiles_kv.get("PROFILES", "").split(",") if p.strip()]
+    if model_name not in profiles:
+        profiles.append(model_name)
+    profiles_kv["PROFILES"] = ",".join(profiles)
+    if not profiles_kv.get("DEFAULT_MODEL"):
+        profiles_kv["DEFAULT_MODEL"] = model_name
 
+    # Per-profile family / thinking.
+    profiles_kv[f"MODEL_FAMILY_{model_name}"] = str(analysis.model_family)
+    profiles_kv[f"THINKING_MODE_{model_name}"] = str(analysis.thinking_mode)
+    # Make sure this account is bound to the model we just created.
+    profiles_kv[f"ACCOUNT_{account_name}_F_SID"] = analysis.f_sid
+    profiles_kv[f"ACCOUNT_{account_name}_AT"] = analysis.at
+    profiles_kv[f"ACCOUNT_{account_name}_SN_PARAM"] = analysis.sn_param
+    profiles_kv[f"ACCOUNT_{account_name}_BL_PARAM"] = analysis.bl_param
+    profiles_kv[f"ACCOUNT_{account_name}_HL"] = analysis.hl
+    profiles_kv[f"ACCOUNT_{account_name}_UUID"] = analysis.session_uuid
+    profiles_kv[f"ACCOUNT_{account_name}_HASH"] = analysis.request_hash
+    profiles_kv[f"ACCOUNT_{account_name}_ENABLED"] = "true"
+    profiles_kv[f"ACCOUNT_{account_name}_MODELS"] = model_name
+
+    # Serialise, ordered: known top-level first, then the rest.
+    ordered_keys = [
+        "HOST", "PORT", "API_KEY", "ADMIN_KEY", "ROTATION_STRATEGY",
+        "MAX_ERRORS_BEFORE_DISABLE", "LOG_LEVEL", "GLOBAL_RATE_LIMIT_RPM",
+        "PROFILES", "DEFAULT_MODEL", "PERSIST_ACCOUNTS", "CORS_ORIGINS",
+    ]
+    rendered: list[str] = []
+    seen: set[str] = set()
+    for k in ordered_keys:
+        if k in profiles_kv:
+            rendered.append(f"{k}={profiles_kv[k]}")
+            seen.add(k)
+    for k, v in profiles_kv.items():
+        if k in seen:
+            continue
+        rendered.append(f"{k}={v}")
+    return rendered
+
+
+def write_env_file(lines: list[str], path: Path) -> None:
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+# ── GUI ──────────────────────────────────────────────────────────────
 
 class ConfigToolGUI:
-    def __init__(self):
-        self.root = tk.Tk()
-        self.root.title("Gemini → OpenAI 代理配置工具")
-        self.root.geometry("750x650")
-        self.root.minsize(600, 500)
+    def __init__(self, root: tk.Tk):
+        self.root = root
+        self.root.title(APP_TITLE)
+        self.root.geometry("980x720")
+        self.analysis: Optional[GeminiHarAnalysis] = None
+        self.proc: Optional[subprocess.Popen] = None
+        self.proc_thread: Optional[threading.Thread] = None
+        self._build()
 
-        style = ttk.Style()
-        style.theme_use("vista" if "vista" in style.theme_names() else "clam")
+    # ── layout ──────────────────────────────────────────────────────
 
-        main_frame = ttk.Frame(self.root, padding=16)
-        main_frame.pack(fill=tk.BOTH, expand=True)
+    def _build(self) -> None:
+        pad = {"padx": 8, "pady": 4}
+        frm_top = ttk.Frame(self.root)
+        frm_top.pack(fill=tk.X, **pad)
 
-        header = ttk.Label(main_frame, text="Gemini → OpenAI 代理配置",
-                           font=("Segoe UI", 16, "bold"))
-        header.pack(anchor=tk.W, pady=(0, 4))
-
-        sub = ttk.Label(main_frame, text="选择 HAR 文件后自动解析并保存配置到 .env",
-                        foreground="#666")
-        sub.pack(anchor=tk.W, pady=(0, 16))
-
-        # HAR file selection
-        file_frame = ttk.Frame(main_frame)
-        file_frame.pack(fill=tk.X, pady=(0, 8))
-
-        ttk.Label(file_frame, text="HAR 文件:", font=("Segoe UI", 10, "bold"))\
-            .pack(side=tk.LEFT, padx=(0, 8))
-
+        ttk.Button(frm_top, text="选择 HAR 文件…", command=self._choose_har).pack(side=tk.LEFT)
         self.har_path_var = tk.StringVar()
-        self.har_entry = ttk.Entry(file_frame, textvariable=self.har_path_var)
-        self.har_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
+        ttk.Entry(frm_top, textvariable=self.har_path_var, width=60).pack(side=tk.LEFT, padx=4)
+        ttk.Button(frm_top, text="解析", command=self._parse_har).pack(side=tk.LEFT)
 
-        ttk.Button(file_frame, text="浏览...", command=self._browse_har)\
-            .pack(side=tk.LEFT)
-        ttk.Button(file_frame, text="解析", command=self._parse)\
-            .pack(side=tk.LEFT, padx=(4, 0))
+        frm_meta = ttk.LabelFrame(self.root, text="解析结果")
+        frm_meta.pack(fill=tk.X, **pad)
+        self.tree = ttk.Treeview(frm_meta, columns=("field", "value"), show="headings", height=10)
+        self.tree.heading("field", text="字段")
+        self.tree.heading("value", text="值")
+        self.tree.column("field", width=160, anchor=tk.W)
+        self.tree.column("value", width=720, anchor=tk.W)
+        self.tree.pack(fill=tk.X, **pad)
 
-        # Model name
-        name_frame = ttk.Frame(main_frame)
-        name_frame.pack(fill=tk.X, pady=(0, 12))
+        frm_cfg = ttk.LabelFrame(self.root, text="配置")
+        frm_cfg.pack(fill=tk.X, **pad)
+        ttk.Label(frm_cfg, text="账号名:").grid(row=0, column=0, sticky=tk.W, **pad)
+        self.account_name_var = tk.StringVar(value="account1")
+        ttk.Entry(frm_cfg, textvariable=self.account_name_var, width=32).grid(row=0, column=1, sticky=tk.W)
+        ttk.Label(frm_cfg, text="模型名:").grid(row=0, column=2, sticky=tk.W, **pad)
+        self.model_name_var = tk.StringVar(value="gemini-default")
+        ttk.Entry(frm_cfg, textvariable=self.model_name_var, width=32).grid(row=0, column=3, sticky=tk.W)
+        ttk.Button(frm_cfg, text="保存到 .env", command=self._save_env).grid(row=0, column=4, **pad)
+        ttk.Button(frm_cfg, text="启动代理服务器", command=self._start_server).grid(row=0, column=5, **pad)
 
-        ttk.Label(name_frame, text="模型名:", font=("Segoe UI", 10, "bold"))\
-            .pack(side=tk.LEFT, padx=(0, 8))
+        frm_preview = ttk.LabelFrame(self.root, text=".env 预览")
+        frm_preview.pack(fill=tk.BOTH, expand=True, **pad)
+        self.preview = scrolledtext.ScrolledText(frm_preview, height=14, bg="#101216", fg="#e1e4e8", insertbackground="#e1e4e8")
+        self.preview.pack(fill=tk.BOTH, expand=True)
 
-        self.model_name_var = tk.StringVar(value="gemini-3.5-flash")
-        self.model_name_entry = ttk.Entry(name_frame, textvariable=self.model_name_var, width=30)
-        self.model_name_entry.pack(side=tk.LEFT, padx=(0, 8))
+        frm_log = ttk.LabelFrame(self.root, text="服务器日志")
+        frm_log.pack(fill=tk.BOTH, expand=True, **pad)
+        self.log_box = scrolledtext.ScrolledText(frm_log, height=10, bg="#0a0d11", fg="#9bc995", insertbackground="#9bc995")
+        self.log_box.pack(fill=tk.BOTH, expand=True)
 
-        ttk.Label(name_frame, text="常用: gemini-3.5-flash / gemini-3.1-flash-lite",
-                  foreground="#888", font=("Segoe UI", 8)).pack(side=tk.LEFT)
+    # ── actions ─────────────────────────────────────────────────────
 
-        # Account name
-        acct_frame = ttk.Frame(main_frame)
-        acct_frame.pack(fill=tk.X, pady=(0, 12))
-
-        ttk.Label(acct_frame, text="账号名:", font=("Segoe UI", 10, "bold"))\
-            .pack(side=tk.LEFT, padx=(0, 8))
-
-        self.acct_name_var = tk.StringVar(value="default")
-        self.acct_name_entry = ttk.Entry(acct_frame, textvariable=self.acct_name_var, width=30)
-        self.acct_name_entry.pack(side=tk.LEFT, padx=(0, 8))
-
-        ttk.Label(acct_frame, text="标识不同 Google 账号，如 main / backup",
-                  foreground="#888", font=("Segoe UI", 8)).pack(side=tk.LEFT)
-
-        # Notebook for results
-        self.notebook = ttk.Notebook(main_frame)
-        self.notebook.pack(fill=tk.BOTH, expand=True)
-
-        # Tab 1: extracted info
-        self.info_frame = ttk.Frame(self.notebook, padding=8)
-        self.notebook.add(self.info_frame, text="  解析信息  ")
-
-        self.info_tree = ttk.Treeview(self.info_frame, columns=("key", "value"),
-                                       show="tree headings", height=18)
-        self.info_tree.heading("#0", text="字段")
-        self.info_tree.heading("key", text="键")
-        self.info_tree.heading("value", text="值")
-        self.info_tree.column("#0", width=180, minwidth=120)
-        self.info_tree.column("key", width=200, minwidth=120)
-        self.info_tree.column("value", width=300, minwidth=200)
-
-        vsb = ttk.Scrollbar(self.info_frame, orient=tk.VERTICAL, command=self.info_tree.yview)
-        self.info_tree.configure(yscrollcommand=vsb.set)
-        self.info_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        vsb.pack(side=tk.RIGHT, fill=tk.Y)
-
-        # Tab 2: .env preview
-        self.env_frame = ttk.Frame(self.notebook, padding=8)
-        self.notebook.add(self.env_frame, text="  .env 预览  ")
-
-        self.env_text = tk.Text(self.env_frame, wrap=tk.NONE, font=("Consolas", 10),
-                                 bg="#1e1e1e", fg="#d4d4d4", insertbackground="white")
-        env_vsb = ttk.Scrollbar(self.env_frame, orient=tk.VERTICAL, command=self.env_text.yview)
-        env_hsb = ttk.Scrollbar(self.env_frame, orient=tk.HORIZONTAL, command=self.env_text.xview)
-        self.env_text.configure(yscrollcommand=env_vsb.set, xscrollcommand=env_hsb.set)
-        self.env_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        env_vsb.pack(side=tk.RIGHT, fill=tk.Y)
-        env_hsb.pack(side=tk.BOTTOM, fill=tk.X)
-
-        # Save button area
-        btn_frame = ttk.Frame(main_frame)
-        btn_frame.pack(fill=tk.X, pady=(12, 0))
-
-        self.status_var = tk.StringVar(value="就绪")
-        status_label = ttk.Label(btn_frame, textvariable=self.status_var,
-                                  font=("Segoe UI", 9), foreground="#555")
-        status_label.pack(side=tk.LEFT)
-
-        ttk.Button(btn_frame, text="保存到 .env",
-                   command=self._save_env).pack(side=tk.RIGHT, padx=(8, 0))
-
-        ttk.Button(btn_frame, text="启动代理服务器",
-                   command=self._launch_server).pack(side=tk.RIGHT, padx=(8, 0))
-
-        self._parsed_info = None
-        self._env_content = ""
-
-        # Auto-load existing har from .env
-        self._try_load_existing()
-
-        self.root.mainloop()
-
-    def _try_load_existing(self):
-        if os.path.exists(ENV_PATH):
-            har_path = None
-            with open(ENV_PATH, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if line.startswith("HAR_PATH="):
-                        har_path = line.split("=", 1)[1]
-                        break
-            if har_path and os.path.exists(har_path):
-                self.har_path_var.set(har_path)
-                self._parse()
-            elif har_path:
-                self.har_path_var.set(har_path)
-
-    def _browse_har(self):
-        path = filedialog.askopenfilename(
-            title="选择 HAR 文件",
-            filetypes=[("HAR files", "*.har"), ("All files", "*.*")],
-            initialdir=SELF_DIR,
-        )
+    def _choose_har(self) -> None:
+        path = filedialog.askopenfilename(filetypes=[("HAR files", "*.har"), ("All", "*.*")])
         if path:
             self.har_path_var.set(path)
 
-    def _parse(self):
-        har_path = self.har_path_var.get().strip()
-        if not har_path:
-            messagebox.showwarning("提示", "请先选择一个 HAR 文件")
+    def _parse_har(self) -> None:
+        path = self.har_path_var.get().strip()
+        if not path or not Path(path).is_file():
+            messagebox.showerror("错误", f"HAR 文件不存在:\n{path}")
             return
-        if not os.path.exists(har_path):
-            messagebox.showerror("错误", f"文件不存在:\n{har_path}")
-            return
-
-        self.status_var.set("正在解析...")
-        self.root.update()
-
         try:
-            info = parse_har_file(har_path)
-            self._parsed_info = info
-        except Exception as e:
-            messagebox.showerror("解析失败", f"解析 HAR 文件时出错:\n{e}")
-            self.status_var.set("解析失败")
+            self.analysis = parse_har(path)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("parse_har_failed")
+            messagebox.showerror("解析失败", str(exc))
             return
-
-        # Show in tree
-        self._populate_tree(info)
-
-        # Auto-detect model family for name hint
-        mf = info.get("model_family", 1)
-        tm = info.get("thinking_mode", 1)
-        name_hint = {1: "gemini-3.5-flash", 3: "gemini-3.1-pro", 6: "gemini-3.1-flash-lite"}.get(mf, f"model-family-{mf}")
-        if tm == 2:
-            name_hint += "-adv"
-        self.model_name_var.set(name_hint)
-
-        # Build env - 只更新对应 profile+account，保留其他部分
-        model_name = self.model_name_var.get().strip()
-        account_name = self.acct_name_var.get().strip()
-        self._env_content = update_env_with_profile(info, model_name, account_name)
-        self.env_text.delete("1.0", tk.END)
-        self.env_text.insert("1.0", self._env_content)
-        self.env_text.see("1.0")
-
-        errors = info.get("_errors", [])
-        warnings = info.get("_warnings", [])
-        msgs = []
-        if errors:
-            msgs.append(f"⚠ {len(errors)} 个错误")
-        if warnings:
-            msgs.append(f"⚠ {len(warnings)} 个警告")
-        response_preview = info.get("_response_preview")
-        if response_preview:
-            msgs.append(f"✓ 响应预览: {response_preview[:60]}...")
-        else:
-            msgs.append("✓ 解析完成")
-        self.status_var.set(" | ".join(msgs))
-
-    def _populate_tree(self, info: dict):
-        for item in self.info_tree.get_children():
-            self.info_tree.delete(item)
-
-        display = [
-            ("目标地址", "base_url"),
-            ("聊天端点", "chat_endpoint"),
-            ("认证类型", "auth_type"),
-            ("Cookie", "cookies"),
-            ("Authorization", "auth_header"),
-            ("bl 参数", "bl_param"),
-            ("f.sid", "f_sid"),
-            ("语言", "hl"),
-            ("at 令牌", "at"),
-            ("sn 参数", "sn_param"),
-            ("会话ID (conv_id)", "_conv_id"),
-            ("响应ID (resp_id)", "_resp_id"),
-            ("内容引用ID (rc_id)", "_rc_id"),
-            ("令牌 (token26)", "_token26"),
-            ("模型家族", "model_family"),
-            ("思考模式", "thinking_mode"),
-            ("会话 UUID", "session_uuid"),
-            ("请求 Hash", "request_hash"),
-            ("流式支持", "is_streaming"),
-            ("WebSocket", "has_websocket"),
-            ("PoW 挑战", "has_pow"),
-            ("请求头数量", "header_count"),
-            ("响应预览", "_response_preview"),
+        for row in self.tree.get_children():
+            self.tree.delete(row)
+        rows = [
+            ("bl_param", self.analysis.bl_param),
+            ("f.sid", self.analysis.f_sid),
+            ("hl", self.analysis.hl),
+            ("at", self.analysis.at),
+            ("sn_param", self.analysis.sn_param),
+            ("model_family", self.analysis.model_family),
+            ("thinking_mode", self.analysis.thinking_mode),
+            ("session_uuid", self.analysis.session_uuid),
+            ("request_hash", self.analysis.request_hash),
         ]
+        for field_name, val in rows:
+            self.tree.insert("", tk.END, values=(field_name, val))
+        self.model_name_var.set(_suggest_model_name(self.analysis.model_family, self.analysis.thinking_mode))
+        self._refresh_preview()
 
-        for label, key in display:
-            val = info.get(key)
-            if val is None:
-                val = ""
-            if isinstance(val, bool):
-                val = "是" if val else "否"
-            val_str = str(val)
-            if len(val_str) > 120:
-                val_str = val_str[:120] + "..."
-            self.info_tree.insert("", tk.END, text=label, values=(key, val_str))
-
-    def _save_env(self):
-        if not self._env_content:
-            messagebox.showwarning("提示", "请先解析一个 HAR 文件")
+    def _refresh_preview(self) -> None:
+        if not self.analysis:
             return
+        lines = build_env_lines(self.analysis, self.account_name_var.get().strip() or "account1",
+                                self.model_name_var.get().strip() or "gemini-default")
+        self.preview.delete("1.0", tk.END)
+        self.preview.insert(tk.END, "\n".join(lines))
 
-        model_name = self.model_name_var.get().strip()
-        account_name = self.acct_name_var.get().strip()
-        if not model_name:
-            messagebox.showwarning("提示", "请输入模型名")
+    def _save_env(self) -> None:
+        if not self.analysis:
+            messagebox.showwarning("提示", "请先解析 HAR 文件")
             return
-        if not account_name:
-            messagebox.showwarning("提示", "请输入账号名")
+        account = self.account_name_var.get().strip() or "account1"
+        model = self.model_name_var.get().strip() or "gemini-default"
+        if not re.match(r"^[A-Za-z0-9_.-]{1,64}$", account):
+            messagebox.showerror("错误", "账号名只能包含字母数字、下划线、点、连字符")
             return
-
-        # Rebuild env with current model name, account name, and info
-        self._env_content = update_env_with_profile(self._parsed_info or {}, model_name, account_name)
-        self.env_text.delete("1.0", tk.END)
-        self.env_text.insert("1.0", self._env_content)
-
         try:
-            with open(ENV_PATH, "w", encoding="utf-8") as f:
-                f.write(self._env_content)
-            self.status_var.set(f"✓ Account '{account_name}' + Profile '{model_name}' 已保存")
-            messagebox.showinfo("保存成功",
-                                f"账号 '{account_name}' + 模型 '{model_name}' 已保存到:\n{ENV_PATH}\n\n"
-                                "现在可以启动代理服务器了。")
-        except Exception as e:
-            messagebox.showerror("保存失败", str(e))
+            lines = build_env_lines(self.analysis, account, model)
+            write_env_file(lines, Path(__file__).parent / ENV_FILENAME)
+        except OSError as exc:
+            messagebox.showerror("保存失败", str(exc))
+            return
+        messagebox.showinfo("已保存", f"{ENV_FILENAME} 已更新。请重启代理服务器。")
 
-    def _launch_server(self):
-        if not self._env_content:
-            if not messagebox.askyesno("提示", "尚未保存配置，是否先保存？"):
-                return
-            self._save_env()
+    def _port_in_use(self, port: int) -> bool:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(0.5)
+            try:
+                s.bind(("127.0.0.1", port))
+            except OSError:
+                return True
+        return False
 
+    def _start_server(self) -> None:
+        if self.proc and self.proc.poll() is None:
+            messagebox.showinfo("提示", "代理服务器已在运行")
+            return
+        here = Path(__file__).parent
+        env_path = here / ENV_FILENAME
+        if env_path.exists():
+            load_dotenv(env_path, override=True)
         try:
-            import subprocess
-            import sys
-            server_script = os.path.join(SELF_DIR, "server.py")
-            if not os.path.exists(server_script):
-                messagebox.showerror("错误", f"找不到 server.py:\n{server_script}")
-                return
+            port = int(os.getenv("PORT", "1800"))
+        except ValueError:
+            port = 1800
+        if self._port_in_use(port):
+            messagebox.showerror("端口冲突", f"端口 {port} 已被占用,无法启动。\n请修改 .env 中的 PORT= 后重试。")
+            return
+        creationflags = 0
+        if os.name == "nt":
+            creationflags = subprocess.CREATE_NO_WINDOW
+        self.proc = subprocess.Popen(
+            [sys.executable, "-u", str(here / "server.py"), str(port)],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            creationflags=creationflags, cwd=str(here),
+        )
+        self.proc_thread = threading.Thread(target=self._drain_proc, daemon=True)
+        self.proc_thread.start()
+        self.log_box.insert(tk.END, f"--- 已启动 PID {self.proc.pid} (port={port}) ---\n")
+        self.log_box.see(tk.END)
 
-            existing = read_existing_env()
-            port = existing.get("PORT", "1800")
-            dmodel = existing.get("DEFAULT_MODEL", "gemini-3.5-flash")
+    def _drain_proc(self) -> None:
+        assert self.proc and self.proc.stdout
+        for line in self.proc.stdout:
+            self.root.after(0, self._append_log, line)
+        rc = self.proc.wait() if self.proc else -1
+        self.root.after(0, self._append_log, f"--- 进程退出 (rc={rc}) ---\n")
 
-            proc = subprocess.Popen(
-                [sys.executable, "-u", server_script, str(port)],
-                cwd=SELF_DIR,
-                creationflags=subprocess.CREATE_NO_WINDOW,
-            )
+    def _append_log(self, line: str) -> None:
+        self.log_box.insert(tk.END, line)
+        self.log_box.see(tk.END)
 
-            self.status_var.set(f"✓ 服务器已启动 (PID: {proc.pid})")
-            models = existing.get("PROFILES", dmodel)
-            messagebox.showinfo("服务器已启动",
-                                f"代理服务器已在后台启动 (PID: {proc.pid})\n\n"
-                                f"访问地址: http://localhost:{port}\n\n"
-                                f"可用模型: {models}\n\n"
-                                f"测试命令:\n"
-                                f'curl http://localhost:{port}/v1/chat/completions -H "Content-Type: application/json" -d \'{{"model":"{dmodel}","messages":[{{"role":"user","content":"hi"}}]}}\'')
-        except Exception as e:
-            messagebox.showerror("启动失败", str(e))
+
+# ── entry ────────────────────────────────────────────────────────────
+
+def main() -> int:
+    if os.name != "nt":
+        try:
+            ttk.Style().theme_use("clam")
+        except tk.TclError:
+            pass
+    root = tk.Tk()
+    ConfigToolGUI(root)
+    root.mainloop()
+    return 0
 
 
 if __name__ == "__main__":
-    ConfigToolGUI()
+    sys.exit(main())

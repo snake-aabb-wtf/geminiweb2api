@@ -4,41 +4,106 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>账号管理 — Gemini2API</title>
+<link rel="stylesheet" href="/static/style.css">
 <script src="https://unpkg.com/htmx.org@2.0.4"></script>
-<style>
-* { margin: 0; padding: 0; box-sizing: border-box; }
-body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f1117; color: #e1e4e8; }
-nav { background: #161b22; border-bottom: 1px solid #30363d; padding: 12px 24px; display: flex; align-items: center; gap: 24px; }
-nav a { color: #8b949e; text-decoration: none; font-size: 14px; padding: 4px 8px; border-radius: 4px; }
-nav a:hover { color: #58a6ff; background: #1c2128; }
-nav .brand { color: #f0f6fc; font-size: 18px; font-weight: 700; }
-.container { max-width: 1200px; margin: 0 auto; padding: 24px; }
-h2 { margin-bottom: 16px; }
-table { width: 100%; border-collapse: collapse; background: #161b22; border: 1px solid #30363d; border-radius: 8px; overflow: hidden; }
-th { background: #1c2128; padding: 12px 16px; text-align: left; font-size: 13px; color: #8b949e; text-transform: uppercase; letter-spacing: 0.5px; border-bottom: 1px solid #30363d; }
-td { padding: 12px 16px; border-bottom: 1px solid #21262d; font-size: 14px; }
-tr:hover { background: #1c2128; }
-button { background: #21262d; color: #c9d1d9; border: 1px solid #30363d; border-radius: 6px; padding: 6px 16px; cursor: pointer; font-size: 13px; }
-button:hover { background: #30363d; border-color: #8b949e; }
-.back { display: inline-block; margin-bottom: 16px; color: #58a6ff; text-decoration: none; font-size: 14px; }
-.back:hover { text-decoration: underline; }
-</style>
 </head>
 <body>
 <nav>
   <span class="brand">✨ Gemini2API</span>
   <a href="/">仪表盘</a>
-  <a href="/webui/accounts">账号管理</a>
+  <a href="/webui/accounts" class="active">账号管理</a>
+  <a href="/webui/logs">实时日志</a>
+  <span style="margin-left:auto" class="tag">v{{version}}</span>
+  <a class="btn" href="/api/auth/logout" style="margin-left:8px">登出</a>
 </nav>
 <div class="container">
   <a class="back" href="/">← 返回仪表盘</a>
   <h2>账号管理</h2>
+
+  <details style="margin-bottom:24px">
+    <summary style="cursor:pointer;color:var(--accent);font-size:14px">➕ 添加新账号 (粘贴 HAR / JSON / 表单)</summary>
+    <div style="background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:16px;margin-top:8px">
+      <div class="form-row">
+        <label for="new-account-name">账号名</label>
+        <input id="new-account-name" placeholder="myaccount" pattern="[A-Za-z0-9_.\-]{1,64}">
+      </div>
+      <div class="form-row">
+        <label for="new-account-model">绑定模型</label>
+        <select id="new-account-model">
+          {% for name in profiles %}<option value="{{name}}">{{name}}</option>{% endfor %}
+        </select>
+      </div>
+      <div class="form-row">
+        <label for="new-account-har">从 HAR 导入 (可选,粘贴完整 HAR JSON)</label>
+        <textarea id="new-account-har" rows="6" placeholder='{"log": {"entries": [...]}}'></textarea>
+        <button onclick="importHar()" style="margin-top:6px">解析 HAR 并填充下方字段</button>
+      </div>
+      <div class="cards" style="grid-template-columns:1fr 1fr">
+        <div class="form-row"><label>F_SID</label><input id="f_f_sid"></div>
+        <div class="form-row"><label>AT (认证令牌)</label><input id="f_at"></div>
+        <div class="form-row"><label>SN_PARAM</label><input id="f_sn"></div>
+        <div class="form-row"><label>BL_PARAM</label><input id="f_bl"></div>
+        <div class="form-row"><label>UUID</label><input id="f_uuid"></div>
+        <div class="form-row"><label>HASH</label><input id="f_hash"></div>
+        <div class="form-row"><label>HL</label><input id="f_hl" value="zh-CN"></div>
+        <div class="form-row"><label>Rate limit (RPM)</label><input id="f_rpm" type="number" value="60" min="1" max="6000"></div>
+      </div>
+      <button class="primary" onclick="submitNew()">保存账号</button>
+    </div>
+  </details>
+
   <table>
-    <thead><tr><th>账号</th><th>错误数</th><th>绑定模型</th><th>状态</th><th>操作</th></tr></thead>
-    <tbody>
-      {{accounts_table}}
-    </tbody>
+    <thead>
+      <tr>
+        <th>账号</th><th>错误</th><th>绑定模型</th><th>状态</th>
+        <th>在飞/并发</th><th>近 60s / 限额</th><th>操作</th>
+      </tr>
+    </thead>
+    <tbody>{{accounts_table | safe}}</tbody>
   </table>
 </div>
+<script src="/static/app.js"></script>
+<script>
+async function importHar() {
+  const name = document.getElementById("new-account-name").value.trim();
+  const model = document.getElementById("new-account-model").value;
+  const har = document.getElementById("new-account-har").value.trim();
+  if (!name || !har) { gemini.flash("请先填写账号名并粘贴 HAR", "err"); return; }
+  try {
+    const a = await gemini.API.parseHar(har, name, model);
+    document.getElementById("f_f_sid").value = a.f_sid || "";
+    document.getElementById("f_at").value = a.at || "";
+    document.getElementById("f_sn").value = a.sn_param || "";
+    document.getElementById("f_bl").value = a.bl_param || "";
+    document.getElementById("f_uuid").value = a.session_uuid || "";
+    document.getElementById("f_hash").value = a.request_hash || "";
+    document.getElementById("f_hl").value = a.hl || "zh-CN";
+    gemini.flash("HAR 解析成功,字段已填充", "ok");
+  } catch (e) { gemini.flash("解析失败: " + e.message, "err"); }
+}
+
+async function submitNew() {
+  const name = document.getElementById("new-account-name").value.trim();
+  if (!name) { gemini.flash("账号名必填", "err"); return; }
+  const model = document.getElementById("new-account-model").value;
+  const payload = {
+    name,
+    f_sid: document.getElementById("f_f_sid").value,
+    at: document.getElementById("f_at").value,
+    sn_param: document.getElementById("f_sn").value,
+    bl_param: document.getElementById("f_bl").value,
+    session_uuid: document.getElementById("f_uuid").value,
+    request_hash: document.getElementById("f_hash").value,
+    hl: document.getElementById("f_hl").value || "zh-CN",
+    bound_models: [model],
+    rate_limit_rpm: parseInt(document.getElementById("f_rpm").value || "60", 10),
+  };
+  try {
+    await gemini.API.createAccount(payload);
+    gemini.flash("账号已保存", "ok");
+    setTimeout(() => location.reload(), 800);
+  } catch (e) { gemini.flash("保存失败: " + e.message, "err"); }
+}
+</script>
 </body>
 </html>

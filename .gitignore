@@ -9,9 +9,10 @@ __pycache__/
 *.pyc
 *.pyo
 
-# 临时测试文件
-test_*.py
+# 临时分析脚本(用户级,不是仓库的 pytest)
 analyze_*.py
+
+# 日志 / 运行时产物
 server_out.log
 server_log.txt
 crash.log
@@ -19,6 +20,18 @@ crash_err.log
 stdout.log
 stderr.log
 gemini_proxy.log
+*.log
+
+# pytest / coverage 产物
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+.tox/
+
+# IDE
+.vscode/
+.idea/
 
 # 系统生成
 start_proxy.bat
