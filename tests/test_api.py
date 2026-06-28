@@ -94,7 +94,7 @@ async def test_auth_required_when_key_set(monkeypatch, transport):
             r = await client.get("/v1/models")
         assert r.status_code == 401
     finally:
-        monkeypatch.setenv("API_KEY", "")
+        monkeypatch.delenv("API_KEY", raising=False)
         importlib.reload(auth_module)
         importlib.reload(server)
 
@@ -120,7 +120,7 @@ async def test_chat_completions_happy_path(monkeypatch, server_module, transport
     async def fake_send_request(profile, account, messages, reqid, tools=None, attachments=None):
         return fake_response, reqid + 1, 200
 
-    monkeypatch.setattr(server_module, "send_request", fake_send_request)
+    monkeypatch.setattr("adapter.send_request", fake_send_request)
 
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
         r = await client.post(

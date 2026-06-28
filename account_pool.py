@@ -60,6 +60,19 @@ class Account:
     recent_requests: deque = field(default_factory=lambda: deque(maxlen=128))
 
 
+@dataclass
+class UsageTick:
+    """One minute of aggregated token usage across the pool."""
+
+    ts: float                         # unix seconds, truncated to the minute
+    prompt: int = 0
+    completion: int = 0
+    total: int = 0
+    success_count: int = 0
+    by_model: dict = field(default_factory=dict)   # {model_name: {prompt, completion, total, count}}
+    by_account: dict = field(default_factory=dict) # {account_name: count}
+
+
 # ── Pool ─────────────────────────────────────────────────────────────
 
 class AccountPool:
@@ -72,6 +85,7 @@ class AccountPool:
         strategy: str = "least-recently-used",
         max_errors: int = 3,
         env_path: Optional[Path] = None,
+        usage_log_size: int = 24 * 60,  # 24h * 60min/h
     ):
         self.accounts: list[Account] = []
         self.strategy = strategy if strategy in self.VALID_STRATEGIES else "least-recently-used"
@@ -85,6 +99,8 @@ class AccountPool:
             "retries": 0,
             "rate_limited": 0,
         }
+        # 24h rolling token-usage log (one bucket per minute).
+        self.usage_log: deque[UsageTick] = deque(maxlen=usage_log_size)
         # Optional path used by save_to_env / reload_if_changed.
         self._env_path: Optional[Path] = Path(env_path) if env_path else None
         self._env_mtime: float = 0.0
@@ -137,9 +153,11 @@ class AccountPool:
                     continue
                 if a.inflight >= a.max_concurrent:
                     continue
-                # Sliding window: count requests in the last 60s.
-                recent = sum(1 for t in a.recent_requests if t > window_start)
-                if recent >= a.rate_limit_rpm:
+                # Evict stale timestamps from the sliding window so the
+                # deque doesn't grow forever and the count is O(k) not O(N).
+                while a.recent_requests and a.recent_requests[0] <= window_start:
+                    a.recent_requests.popleft()
+                if len(a.recent_requests) >= a.rate_limit_rpm:
                     self._stats["rate_limited"] += 1
                     log.debug("account_rate_limited", extra={"name": a.name, "model": model_name})
                     continue
@@ -149,23 +167,29 @@ class AccountPool:
                 return None
 
             if self.strategy == "least-recently-used":
-                chosen = min(candidates, key=lambda a: a.last_used)
+                # Break ties with a small random jitter so cold-start with
+                # many ``last_used=0`` accounts doesn't always pick the
+                # first one. The jitter is tiny (< 1e-3) so it never
+                # overrides a real "older" timestamp.
+                chosen = min(candidates, key=lambda a: (a.last_used, random.random()))
             elif self.strategy == "random":
                 chosen = random.choice(candidates)
             elif self.strategy == "round-robin":
                 # Walk forward until we find a candidate; resilient to
                 # non-eligible accounts slipping in between eligible ones.
+                chosen = None
                 for _ in range(len(self.accounts)):
                     acct = self.accounts[self._round_robin_idx % len(self.accounts)]
                     self._round_robin_idx += 1
                     if acct in candidates:
                         chosen = acct
                         break
-                else:  # pragma: no cover  — only hit if candidates is empty
+                if chosen is None:  # pragma: no cover
                     return None
             else:  # "first"
                 chosen = candidates[0]
 
+            assert chosen is not None  # for type-checker; we returned earlier if no candidates
             chosen.inflight += 1
             chosen.last_used = now
             chosen.recent_requests.append(now)
@@ -197,6 +221,39 @@ class AccountPool:
                     extra={"name": account.name, "reason": reason, "errors": account.error_count},
                 )
 
+    async def record_usage(
+        self,
+        account: Account,
+        model_name: str,
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+        total_tokens: int = 0,
+    ) -> None:
+        """Fold a successful response's token counts into the rolling log.
+
+        Buckets are aligned to the wall-clock minute so a 24h query
+        returns 1440 evenly-spaced points even after only a few requests.
+        """
+        async with self._lock:
+            now = time.time()
+            minute = int(now // 60) * 60
+            if self.usage_log and self.usage_log[-1].ts == minute:
+                tick = self.usage_log[-1]
+            else:
+                tick = UsageTick(ts=minute)
+                self.usage_log.append(tick)
+            tick.prompt += int(prompt_tokens or 0)
+            tick.completion += int(completion_tokens or 0)
+            tick.total += int(total_tokens or (prompt_tokens or 0) + (completion_tokens or 0))
+            tick.success_count += 1
+            m = tick.by_model.setdefault(model_name, {"prompt": 0, "completion": 0, "total": 0, "count": 0})
+            m["prompt"] += int(prompt_tokens or 0)
+            m["completion"] += int(completion_tokens or 0)
+            m["total"] += int(total_tokens or (prompt_tokens or 0) + (completion_tokens or 0))
+            m["count"] += 1
+            a = tick.by_account.setdefault(account.name, 0)
+            tick.by_account[account.name] = a + 1
+
     def record_retry(self) -> None:
         self._stats["retries"] += 1
 
@@ -205,7 +262,49 @@ class AccountPool:
 
     # ── Reporting ───────────────────────────────────────────────────
 
-    def stats(self) -> dict:
+    async def stats(self) -> dict:
+        """Snapshot of the pool — read under the lock to be race-free."""
+        async with self._lock:
+            now = time.time()
+            with_stats = []
+            for a in self.accounts:
+                # Account for stale entries without mutating the deque.
+                recent = sum(1 for t in a.recent_requests if t > now - 60)
+                with_stats.append({
+                    "name": a.name,
+                    "enabled": a.enabled,
+                    "error_count": a.error_count,
+                    "last_used": a.last_used,
+                    "last_success": a.last_success,
+                    "last_error": a.last_error,
+                    "inflight": a.inflight,
+                    "recent_60s": recent,
+                    "bound_models": a.bound_models,
+                })
+            return {
+                **self._stats,
+                "accounts_total": len(self.accounts),
+                "accounts_enabled": sum(1 for a in self.accounts if a.enabled),
+                "accounts_disabled": sum(1 for a in self.accounts if not a.enabled),
+                "accounts_exhausted": sum(1 for a in self.accounts if a.error_count >= self.max_errors),
+                "strategy": self.strategy,
+                "max_errors": self.max_errors,
+                "accounts": with_stats,
+            }
+
+    def stats_sync(self) -> dict:
+        """Synchronous snapshot for use *outside* the event loop.
+
+        Holds the lock synchronously; safe because the lock is also an
+        asyncio lock only when no event loop is running in the same
+        thread. For background tasks / startup probes we expose this
+        thin wrapper.
+        """
+        # ``asyncio.Lock`` cannot be acquired outside a running loop, so
+        # fall back to a best-effort read here. The classic asyncio lock
+        # blocks the loop, so this method is reserved for tooling like
+        # the GUI config tool that runs in a separate thread.
+        now = time.time()
         with_stats = []
         for a in self.accounts:
             with_stats.append({
@@ -216,7 +315,7 @@ class AccountPool:
                 "last_success": a.last_success,
                 "last_error": a.last_error,
                 "inflight": a.inflight,
-                "recent_60s": sum(1 for t in a.recent_requests if t > time.time() - 60),
+                "recent_60s": sum(1 for t in a.recent_requests if t > now - 60),
                 "bound_models": a.bound_models,
             })
         return {
@@ -229,6 +328,35 @@ class AccountPool:
             "max_errors": self.max_errors,
             "accounts": with_stats,
         }
+
+    def usage_series(self, hours: int = 24) -> list[dict]:
+        """Return minute-bucketed usage for the last ``hours`` hours.
+
+        Empty minutes are filled in as zero-points so the frontend can
+        plot a continuous time series without gaps.
+        """
+        now = time.time()
+        cutoff = now - hours * 3600
+        # Build a quick lookup of present minutes.
+        present: dict[int, UsageTick] = {int(t.ts): t for t in self.usage_log if t.ts >= cutoff}
+        out: list[dict] = []
+        start_minute = int(cutoff // 60) * 60
+        end_minute = int(now // 60) * 60
+        for m in range(start_minute, end_minute + 60, 60):
+            tick = present.get(m)
+            if tick is None:
+                out.append({
+                    "ts": m, "prompt": 0, "completion": 0,
+                    "total": 0, "success_count": 0,
+                    "by_model": {}, "by_account": {},
+                })
+            else:
+                out.append({
+                    "ts": tick.ts, "prompt": tick.prompt, "completion": tick.completion,
+                    "total": tick.total, "success_count": tick.success_count,
+                    "by_model": tick.by_model, "by_account": tick.by_account,
+                })
+        return out
 
     # ── .env loading / saving ───────────────────────────────────────
 

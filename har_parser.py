@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 from urllib.parse import parse_qs, unquote, urlparse
 
@@ -54,7 +54,7 @@ class GeminiHarAnalysis:
 
     base_url: str = "https://gemini.google.com"
     chat_endpoint: str = "/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate"
-    headers: dict = None
+    headers: dict = field(default_factory=dict)
     bl_param: str = ""
     f_sid: str = ""
     hl: str = "zh-CN"
@@ -66,8 +66,10 @@ class GeminiHarAnalysis:
     request_hash: str = ""
 
     def __post_init__(self) -> None:
-        if self.headers is None:
-            self.headers = {}
+        # ``headers`` is initialised via ``field(default_factory=...)``
+        # so we no longer need to coerce ``None`` here; the method is
+        # kept for backwards compatibility.
+        pass
 
 
 def parse_har(har_path: str) -> GeminiHarAnalysis:

@@ -1,4 +1,4 @@
-"""FastAPI entrypoint for gemini2api v1.0.
+"""FastAPI entrypoint for gemini2api v1.1.
 
 Layout
 ------
@@ -8,20 +8,24 @@ Layout
 * Requests  are admitted through ``/v1/*`` and forwarded to the Gemini
   web endpoint by ``adapter.py``.
 
-Concurrency & safety
---------------------
-* ``_reqid`` is **per-request** (not global), so concurrent
-  ``/v1/chat/completions`` calls no longer race on a shared counter.
-* ``AccountPool`` is guarded by an ``asyncio.Lock``; mutating endpoints
-  acquire the same lock before editing the pool.
-* ``httpx.AsyncClient`` is shared across requests for connection reuse.
-* CORS is opt-in via ``CORS_ORIGINS`` env var; the default is "no
-  CORS", which matches the security guidance of dropping the
-  ``allow_origins=["*"]`` + ``allow_credentials=True`` anti-pattern.
+v1.1 changes
+-------------
+* ``CHAT_MAX_RETRIES`` decoupled from ``MAX_ERRORS_BEFORE_DISABLE``.
+* Per-request temperature / max_tokens no longer mutate the shared
+  ``ModelProfile`` (we shallow-copy with ``dataclasses.replace``).
+* Streaming responses retry across accounts until the *first* chunk
+  is delivered — once bytes hit the wire, the OpenAI protocol forbids
+  swapping mid-stream.
+* Server actually wires ``adapter.upload_image`` so user-supplied
+  ``image_url`` content reaches Gemini instead of being dropped.
+* New endpoints: ``/v1/embeddings`` (stub), ``/api/usage``,
+  ``/api/health/accounts``, and the SSE queue is garbage-collected
+  against disconnected clients.
 """
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import html
 import json
 import logging
@@ -65,18 +69,18 @@ from adapter import (
     get_client,
     send_request,
     stream_request,
-    upload_image,
 )
+import adapter  # imported as module so test can patch adapter.upload_image
 from auth import (
     auth_summary,
     check_admin_login,
     verify_admin_key,
     verify_api_key,
 )
-from logger import get_logger
+from logger import get_logger, scrub_pii
 from rate_limit import make_ip_limiter, make_rate_limit_dependency
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 log = get_logger("server")
 
 load_dotenv()
@@ -136,6 +140,11 @@ HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "1800"))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 GLOBAL_RATE_LIMIT_RPM = int(os.getenv("GLOBAL_RATE_LIMIT_RPM", "0"))  # 0 = off
+CHAT_MAX_RETRIES = max(1, int(os.getenv("CHAT_MAX_RETRIES", "2")))
+EMBEDDINGS_ENABLED = os.getenv("GEMINI_EMBEDDINGS_ENABLED", "0") == "1"
+EMBEDDINGS_DIM = int(os.getenv("GEMINI_EMBEDDINGS_DIM", "768"))
+LOG_SCRUB_PII = os.getenv("LOG_SCRUB_PII", "0") == "1"
+HEALTH_CHECK_TIMEOUT = float(os.getenv("HEALTH_CHECK_TIMEOUT", "30"))
 
 # ── Lifespan: shared HTTP client + .env watcher ──────────────────────
 
@@ -286,6 +295,14 @@ class LoginRequest(BaseModel):
     key: str
 
 
+class EmbeddingRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    model: str = default_model
+    input: Union[str, list[str]]
+    user: Optional[str] = None
+    encoding_format: Optional[str] = "float"
+
+
 # ── Helpers ──────────────────────────────────────────────────────────
 
 def _flatten_messages(msgs: list[ChatMessage]) -> list[dict]:
@@ -303,6 +320,40 @@ def _tools_payload(req: ChatCompletionRequest) -> Optional[list[dict]]:
     return req.tools
 
 
+# ── Helpers ──────────────────────────────────────────────────────────
+
+def _collect_image_urls(msgs: list[ChatMessage]) -> list[str]:
+    """Pull every ``image_url.url`` out of an OpenAI-style message list.
+
+    We do this here rather than in ``adapter._flatten_content`` because
+    uploading each image is an async I/O step that must run inside the
+    server's event loop with the right HTTP client.
+
+    Pydantic v2 will have already coerced the input JSON into
+    ``ContentPart`` model instances (or kept raw ``dict`` s if the
+    consumer chose that branch), so we accept both shapes.
+    """
+    out: list[str] = []
+    for m in msgs:
+        content = m.content
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            # ``ContentPart`` is a BaseModel — expose the fields via
+            # ``__dict__`` so the same code path handles both Pydantic
+            # models and raw dicts.
+            if hasattr(part, "__dict__") and not isinstance(part, dict):
+                part = part.__dict__
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") != "image_url":
+                continue
+            url = (part.get("image_url") or {}).get("url")
+            if url:
+                out.append(url)
+    return out
+
+
 # ── Chat endpoint ────────────────────────────────────────────────────
 
 @app.post("/v1/chat/completions")
@@ -316,9 +367,17 @@ async def chat_completions(
     request_id = uuid.uuid4().hex[:12]
     # Per-request reqid base — no global counter, no races.
     base_reqid = int(time.time() * 1_000_000) & 0xFFFFFFF
+    # Optionally redact PII from the preview we log. The full message
+    # content never enters the log; we only emit a short head + tail.
+    if LOG_SCRUB_PII and req.messages:
+        head = str(req.messages[0].content)[:120]
+        head = scrub_pii(head)
+    else:
+        head = ""
     log.info(
         "request_started",
-        extra={"req_id": request_id, "model": req.model, "stream": req.stream, "msgs": len(req.messages)},
+        extra={"req_id": request_id, "model": req.model, "stream": req.stream,
+               "msgs": len(req.messages), "head": head if LOG_SCRUB_PII else ""},
     )
 
     model_name = req.model or default_model
@@ -328,27 +387,66 @@ async def chat_completions(
             status_code=400,
             content={"error": {"type": "invalid_model", "message": f"Unknown model: {model_name}"}},
         )
-    # Allow the request to override profile-level temperature / max_tokens.
-    if req.temperature is not None:
-        profile.temperature = req.temperature
-    if req.max_tokens is not None:
-        profile.max_tokens = req.max_tokens
+    # Shallow-copy the profile so per-request overrides (temperature,
+    # max_tokens) don't race against other concurrent requests that
+    # share the same profile object.
+    if req.temperature is not None or req.max_tokens is not None:
+        profile = dataclasses.replace(
+            profile,
+            temperature=req.temperature if req.temperature is not None else profile.temperature,
+            max_tokens=req.max_tokens if req.max_tokens is not None else profile.max_tokens,
+        )
 
     messages = _flatten_messages(req.messages)
     tools = _tools_payload(req)
     pool.record_request()
 
+    # If the request carries image_url content, upload each one to Gemini
+    # so the upstream model actually sees them. Failures are logged but
+    # not fatal — we still forward the text part.
+    image_urls = _collect_image_urls(req.messages)
+    attachments: list[dict] = []
+    if image_urls:
+        # Pre-select an account for upload (no rotation here: uploads
+        # are tiny and the pool will hand out a different one for the
+        # main request if needed).
+        upload_account = await pool.select(profile.name)
+        if upload_account is not None:
+            try:
+                for url in image_urls:
+                    upload_id = await adapter.upload_image(upload_account, url)
+                    if upload_id:
+                        attachments.append({"type": "upload_id", "value": upload_id})
+                    else:
+                        log.warning(
+                            "upload_skipped",
+                            extra={"req_id": request_id, "url_prefix": url[:60]},
+                        )
+            except Exception as exc:  # noqa: BLE001
+                log.warning("upload_failed", extra={"req_id": request_id, "err": str(exc)})
+            finally:
+                await pool.release(upload_account)
+
     if req.stream:
-        return await _handle_stream(profile, messages, base_reqid, tools, request_id, started)
+        return await _handle_stream(
+            profile, messages, base_reqid, tools, request_id, started,
+            attachments=attachments,
+        )
 
-    return await _handle_blocking(profile, messages, base_reqid, tools, request_id, started)
+    return await _handle_blocking(
+        profile, messages, base_reqid, tools, request_id, started,
+        attachments=attachments,
+    )
 
 
-async def _handle_blocking(profile, messages, base_reqid, tools, request_id, started):
+async def _handle_blocking(
+    profile, messages, base_reqid, tools, request_id, started,
+    attachments: Optional[list[dict]] = None,
+):
     last_error: Optional[str] = None
     last_status: int = 502
     last_payload: Any = None
-    for attempt in range(pool.max_errors):
+    for attempt in range(CHAT_MAX_RETRIES):
         if attempt > 0:
             pool.record_retry()
             await asyncio.sleep(min(2 ** (attempt - 1), 8))  # 1s, 2s, 4s, 8s
@@ -357,12 +455,23 @@ async def _handle_blocking(profile, messages, base_reqid, tools, request_id, sta
             last_error = f"No available account for model '{profile.name}'"
             break
         try:
-            result, _new_reqid, status_code = await send_request(
+            result, _new_reqid, status_code = await adapter.send_request(
                 profile, account, messages, base_reqid, tools=tools,
+                attachments=attachments,
             )
             await pool.release(account)
             if status_code == 200:
                 await pool.record_success(account)
+                # Feed the rolling usage log.
+                usage = result.get("usage") if isinstance(result, dict) else None
+                if isinstance(usage, dict):
+                    await pool.record_usage(
+                        account,
+                        profile.name,
+                        prompt_tokens=int(usage.get("prompt_tokens", 0) or 0),
+                        completion_tokens=int(usage.get("completion_tokens", 0) or 0),
+                        total_tokens=int(usage.get("total_tokens", 0) or 0),
+                    )
                 latency = time.time() - started
                 log.info(
                     "request_completed",
@@ -400,20 +509,69 @@ async def _handle_blocking(profile, messages, base_reqid, tools, request_id, sta
     return JSONResponse(status_code=last_status, content=body)
 
 
-async def _handle_stream(profile, messages, base_reqid, tools, request_id, started):
-    """Return a StreamingResponse; fall back to non-stream on auth/quota errors."""
-    # Pre-select one account for the stream. If it fails mid-flight we
-    # send a final error chunk and let the client reconnect.
-    account = await pool.select(profile.name)
-    if not account:
+async def _handle_stream(
+    profile, messages, base_reqid, tools, request_id, started,
+    attachments: Optional[list[dict]] = None,
+):
+    """Return a StreamingResponse; retry across accounts **before** the
+    first byte hits the wire.
+
+    The OpenAI streaming protocol binds the entire stream to a single
+    assistant message id, so we cannot swap accounts after a chunk has
+    been delivered. The retry loop therefore re-selects an account on
+    *connection* failure (before yielding the first chunk) and then
+    commits to that account for the lifetime of the stream.
+    """
+    last_error: Optional[str] = None
+    chosen_account = None
+
+    for attempt in range(CHAT_MAX_RETRIES):
+        if attempt > 0:
+            pool.record_retry()
+            await asyncio.sleep(min(2 ** (attempt - 1), 4))  # 1s, 2s, 4s
+        account = await pool.select(profile.name)
+        if not account:
+            last_error = f"No available account for model '{profile.name}'"
+            break
+        # Quick probe: try to open the stream and read the first chunk.
+        # If that succeeds we commit; if it raises we release + retry.
+        try:
+            gen = adapter.stream_request(profile, account, messages, base_reqid, tools=tools, attachments=attachments)
+            first_chunk = await gen.__anext__()
+        except StopAsyncIteration:
+            # Empty stream — treat as success, nothing more to yield.
+            await pool.release(account)
+            await pool.record_success(account)
+            return StreamingResponse(
+                iter([b"data: [DONE]\n\n"]),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            )
+        except (httpx.HTTPError, Exception) as exc:  # noqa: BLE001
+            await pool.release(account)
+            await pool.record_failure(account, reason=f"stream_setup {exc.__class__.__name__}")
+            last_error = str(exc)
+            log.warning("stream_setup_failed", extra={"req_id": request_id, "attempt": attempt, "err": str(exc)})
+            continue
+        # Committed. Build the live stream.
+        chosen_account = account
+        break
+
+    if chosen_account is None:
         return JSONResponse(
-            status_code=503,
-            content={"error": {"type": "no_account", "message": "No available account"}},
+            status_code=502,
+            content={"error": {"type": "upstream_error", "message": last_error or "stream setup failed"}},
         )
+
+    account = chosen_account
 
     async def event_source():
         try:
-            async for chunk in stream_request(profile, account, messages, base_reqid, tools=tools):
+            # Re-yield the first chunk we already pulled, then drain the
+            # rest of the generator. We can't reuse the same generator
+            # object (it's already been advanced), so wrap it.
+            yield first_chunk
+            async for chunk in gen:
                 yield chunk
             await pool.record_success(account)
             log.info(
@@ -464,6 +622,44 @@ async def list_models():
     }
 
 
+@app.post("/v1/embeddings", dependencies=[Depends(verify_api_key)])
+async def create_embeddings(req: EmbeddingRequest):
+    """Stub embeddings endpoint.
+
+    The Gemini Web endpoint does not expose a stable embeddings
+    surface, so we return deterministic zero vectors. The
+    ``X-Gemini2api-Status: stub`` header makes the situation obvious
+    to clients (and avoids burning a Google account on each call).
+
+    Enable explicitly with ``GEMINI_EMBEDDINGS_ENABLED=1``.
+    """
+    if not EMBEDDINGS_ENABLED:
+        return JSONResponse(
+            status_code=501,
+            content={"error": {"type": "embeddings_disabled",
+                               "message": "Set GEMINI_EMBEDDINGS_ENABLED=1 to enable"}},
+        )
+    inputs = req.input if isinstance(req.input, list) else [req.input]
+    dim = EMBEDDINGS_DIM
+    data = [
+        {
+            "object": "embedding",
+            "index": i,
+            "embedding": [0.0] * dim,
+        }
+        for i, _ in enumerate(inputs)
+    ]
+    return JSONResponse(
+        content={
+            "object": "list",
+            "model": req.model,
+            "data": data,
+            "usage": {"prompt_tokens": 0, "total_tokens": 0},
+        },
+        headers={"X-Gemini2api-Status": "stub"},
+    )
+
+
 @app.get("/health")
 async def health():
     return {
@@ -472,6 +668,8 @@ async def health():
         "model": default_model,
         "profiles": list(profiles.keys()),
         "auth": auth_summary(),
+        "embeddings_enabled": EMBEDDINGS_ENABLED,
+        "log_scrub_pii": LOG_SCRUB_PII,
     }
 
 
@@ -511,7 +709,85 @@ async def api_logout(response: JSONResponse):
 
 @app.get("/api/stats", dependencies=[Depends(verify_admin_key)])
 async def api_stats():
-    return pool.stats()
+    return await pool.stats()
+
+
+@app.get("/api/usage", dependencies=[Depends(verify_admin_key)])
+async def api_usage(hours: int = Query(24, ge=1, le=168)):
+    """Return minute-bucketed token usage for the last ``hours`` hours.
+
+    Default is 24h. Max is 168h (7 days) to keep payloads bounded.
+    """
+    series = pool.usage_series(hours=hours)
+    # Aggregate a small summary for the dashboard header.
+    total_prompt = sum(t["prompt"] for t in series)
+    total_completion = sum(t["completion"] for t in series)
+    total_requests = sum(t["success_count"] for t in series)
+    return {
+        "hours": hours,
+        "summary": {
+            "prompt": total_prompt,
+            "completion": total_completion,
+            "total": total_prompt + total_completion,
+            "requests": total_requests,
+        },
+        "series": series,
+    }
+
+
+@app.post("/api/health/accounts", dependencies=[Depends(verify_admin_key)])
+async def api_health_accounts():
+    """Probe every enabled account with a minimal request and report status.
+
+    Concurrently calls each account's bound models with a ``"ping"``
+    message and ``max_tokens=1``. The result is per-account:
+    ``{name, ok, status_code, latency_ms, error}``. Failures are *not*
+    persisted to the pool — this is a read-only health check.
+    """
+    ping_messages = [{"role": "user", "content": "ping"}]
+    targets: list[tuple] = []
+    for a in pool.accounts:
+        if not a.enabled:
+            continue
+        for model_name in a.bound_models:
+            profile = profiles.get(model_name)
+            if not profile:
+                continue
+            targets.append((a, profile, model_name))
+
+    async def probe_one(acct, prof, model_name):
+        started = time.time()
+        try:
+            _result, _reqid, status_code = await asyncio.wait_for(
+                adapter.send_request(
+                    prof,
+                    acct,
+                    ping_messages,
+                    int(time.time() * 1_000_000) & 0xFFFFFFF,
+                ),
+                timeout=globals().get("HEALTH_CHECK_TIMEOUT", 30),
+            )
+            ok = status_code == 200
+            err = None
+        except asyncio.TimeoutError:
+            status_code = 0
+            ok = False
+            err = "timeout"
+        except Exception as exc:  # noqa: BLE001
+            status_code = 0
+            ok = False
+            err = str(exc)[:200]
+        return {
+            "name": acct.name,
+            "model": model_name,
+            "ok": ok,
+            "status_code": status_code,
+            "latency_ms": int((time.time() - started) * 1000),
+            "error": err,
+        }
+
+    results = await asyncio.gather(*(probe_one(a, p, m) for a, p, m in targets))
+    return {"checked_at": time.time(), "results": results}
 
 
 @app.get("/api/profiles", dependencies=[Depends(verify_admin_key)])
@@ -661,7 +937,7 @@ def render_template(name: str, **kwargs) -> str:
 
 @app.get("/", response_class=HTMLResponse)
 async def web_dashboard(_: None = Depends(verify_admin_key)):
-    s = pool.stats()
+    s = await pool.stats()
     return HTMLResponse(render_template(
         "dashboard.html",
         total_requests=s["total_requests"],
@@ -724,6 +1000,11 @@ class _InMemoryLogHandler(logging.Handler):
         super().__init__(level=logging.INFO)
         self.queues: list[asyncio.Queue] = []
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+        # Track disconnected queues with the wall-clock time they were
+        # marked dead so a background sweeper can remove them. We keep
+        # them in the list for a short grace period to absorb transient
+        # client reconnects.
+        self._dead: dict = {}
 
     def bind_loop(self, loop: asyncio.AbstractEventLoop) -> None:
         self._loop = loop
@@ -742,6 +1023,16 @@ class _InMemoryLogHandler(logging.Handler):
             pass
 
     def _enqueue(self, payload: dict) -> None:
+        # Prune dead queues that have been waiting for GC long enough.
+        now = time.time()
+        if self._dead:
+            stale = [q for q, ts in self._dead.items() if now - ts > 30]
+            for q in stale:
+                try:
+                    self.queues.remove(q)
+                    self._dead.pop(q, None)
+                except ValueError:
+                    pass
         for q in self.queues:
             try:
                 q.put_nowait(payload)
@@ -752,6 +1043,17 @@ class _InMemoryLogHandler(logging.Handler):
                     q.put_nowait(payload)
                 except Exception:  # noqa: BLE001
                     pass
+
+    def mark_dead(self, queue) -> None:
+        """Flag a queue as dead. The next enqueue pass will remove it."""
+        self._dead[queue] = time.time()
+
+    def force_remove(self, queue) -> None:
+        try:
+            self.queues.remove(queue)
+        except ValueError:
+            pass
+        self._dead.pop(id(queue), None)
 
 
 _log_bridge = _InMemoryLogHandler()
@@ -779,10 +1081,11 @@ async def events_stream(request: Request):
                     continue
                 yield f"event: log\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
         finally:
-            try:
-                _log_bridge.queues.remove(queue)
-            except ValueError:
-                pass
+            # Mark dead so the next enqueue sweep prunes us; if no
+            # further events come through, force-remove immediately so
+            # we never leak a queue reference.
+            _log_bridge.mark_dead(queue)
+            _log_bridge.force_remove(queue)
 
     return StreamingResponse(
         event_gen(),

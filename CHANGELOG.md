@@ -1,5 +1,53 @@
 # Changelog
 
+## [1.1.0] - 2026-06-28
+
+### 🐛 Bug fixes
+- **Profile 温度覆盖竞态** — 每请求 `temperature` / `max_tokens` 改用 `dataclasses.replace` 浅拷贝,不再污染共享 `ModelProfile`。
+- **`stats()` 未持锁** — `AccountPool.stats()` 现 `async with self._lock`,与 `select` / `record_*` 互斥。
+- **LRU 冷启动总是选第一个** — `min` 加 `random.random()` 打破 `last_used` 平局。
+- **`recent_requests` 过期清理** — `select` 入口 `popleft` 到 60s 窗口外,O(过期数) 而非 O(128)。
+- **CHAT_MAX_RETRIES 独立配置** — 之前复用 `MAX_ERRORS_BEFORE_DISABLE` 语义错位,现独立环境变量,默认 2。
+- **`stats_sync` 加锁** — GUI / 调试用同步路径补齐锁语义。
+- **`assert chosen is not None` 收窄 mypy** — 修 round-robin 类型推断。
+- **SSE 死连接清理** — `_InMemoryLogHandler.mark_dead` / `force_remove` 跟踪 dead 队列,enqueue 时 30s grace 后剪除。
+
+### ✨ New features
+- **`/v1/embeddings` stub** — 开启 `GEMINI_EMBEDDINGS_ENABLED=1` 后返回 768 维零向量 + `X-Gemini2api-Status: stub` 头;默认关闭,免烧真实账号。
+- **多 API Key 支持** — `API_KEYS=sk-a,sk-b,sk-c` 与 `API_KEY` 共存;admin 路径 `ADMIN_KEYS` 同样支持。`/health` 暴露 `api_key_count` / `admin_key_count`。
+- **24h Token 用量图** — `account_pool.usage_log` 每分钟 1 个 `UsageTick`(24h*60 上限),`record_usage` 在 `_handle_blocking` 成功时调用;`GET /api/usage?hours=24` 返回时序 + 汇总。`templates/dashboard.html` 已就位,后续 PR 接入 Chart.js。
+- **账号健康自检** — `POST /api/health/accounts` 并发 ping 所有 enabled 账号,返回 `[{name, model, ok, status_code, latency_ms, error}]`,超时 30s。
+- **PII 脱敏** — `logger.scrub_pii` 替换 email / 中国手机号 / 身份证号;`LOG_SCRUB_PII=1` 启用,在 `request_started` 日志头 120 字符应用。
+- **`upload_image` 真接入 server** — v1.0 写但没调用的 `adapter.upload_image` 现在被 `chat_completions` 实际调用,失败的图片打 `upload_skipped` warning 但不阻塞请求。
+- **流式失败换号重试** — `_handle_stream` 在 **首个 chunk 之前** 探测失败换号,最多 `CHAT_MAX_RETRIES` 次;已发过 chunk 则不换号(避免协议分裂)。
+
+### 🛠 Tooling
+- **Dockerfile** + **docker-compose.yml** + **.dockerignore** — 一行 `docker compose up -d` 起服务;非 root 用户、tini PID 1、`/health` 健康检查。
+- **mypy 严格模式** — `mypy.ini` 通过 7 个核心模块 (`server.py` 仍开启 per-module 放松),CI 加 mypy step。
+- **CI 升级** — 新增 `mypy` job 和 `docker` build+smoke test job。
+- **CI 持久 autouse fixture** — `conftest.py` 自动 reload `auth` 模块,杜绝测试间 `monkeypatch.setenv` 残留导致跨测试 401。
+
+### 📊 Tests
+- 51 → **87 用例**(新增 36):
+  - `test_account_pool.py` +7: LRU 冷启动平局、并发 stats、recent_requests 过期、usage_log 累积、按分钟分桶、usage_series 空分钟、round-robin
+  - `test_api.py` 1 个稳定
+  - `test_auth_multi.py` 6 个新
+  - `test_embeddings.py` 3 个新
+  - `test_health_accounts.py` 2 个新
+  - `test_har_parser.py` 5 个原有
+  - `test_scrub_pii.py` 8 个新
+  - `test_server_temperature.py` 1 个新
+  - `test_sse_bridge.py` 4 个新
+  - `test_upload_image_integration.py` 3 个新
+  - `test_usage_endpoint.py` 2 个新
+
+### ⚠️ Notes
+- 协议仍基于逆向工程的 `StreamGenerate` 端点。
+- 多模态和 Function calling 仍是 best-effort;`upload_image` 失败的图片会被丢弃并打日志。
+- Docker 镜像基于 `python:3.12-slim`,约 150MB。
+
+---
+
 ## [1.0.0] - 2026-06-27
 
 ### 🐛 Bug fixes

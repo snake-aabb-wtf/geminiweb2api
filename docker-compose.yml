@@ -1,0 +1,27 @@
+services:
+  gemini2api:
+    build: .
+    image: gemini2api:1.1
+    container_name: gemini2api
+    restart: unless-stopped
+    ports:
+      - "${PORT:-1800}:1800"
+    volumes:
+      # Read-only .env so the container never overwrites your secrets.
+      - ./.env:/app/.env:ro
+      # Persist log output across container restarts.
+      - ./logs:/app/logs
+    environment:
+      # Defaults match the .env.example. Override here or in .env.
+      HOST: "0.0.0.0"
+      PORT: "1800"
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+      LOG_FILE: "${LOG_FILE:-/app/logs/gemini_proxy.log}"
+      GLOBAL_RATE_LIMIT_RPM: "${GLOBAL_RATE_LIMIT_RPM:-0}"
+      CHAT_MAX_RETRIES: "${CHAT_MAX_RETRIES:-2}"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:1800/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

@@ -9,7 +9,7 @@ on:
 
 jobs:
   test:
-    name: pytest (ubuntu-latest, py${{ matrix.python-version }})
+    name: pytest (py${{ matrix.python-version }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -46,17 +46,47 @@ jobs:
           coverage run --source=adapter,account_pool,auth,rate_limit,logger,har_parser,server -m pytest tests/ -q
           coverage report -m --skip-covered
 
-  lint:
-    name: pyflakes
+  mypy:
+    name: mypy (py3.12)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install pyflakes
-      - name: Pyflakes
-        # Best-effort lint; we don't block on warnings, only on syntax errors.
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - name: Install mypy
+        run: pip install mypy==1.10.*
+      - name: Type-check core modules
         run: |
-          python -m pyflakes adapter.py account_pool.py auth.py rate_limit.py logger.py har_parser.py server.py 2>&1 | tee lint.txt
-          echo "lint complete (see lint.txt)"
+          mypy \
+            server.py adapter.py account_pool.py auth.py logger.py rate_limit.py har_parser.py config_tool.py
+
+  docker:
+    name: Docker build (linux/amd64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build image
+        run: docker build -t gemini2api:ci .
+      - name: Smoke test
+        run: |
+          # Launch the container in the background, hit /health, kill.
+          docker run -d --rm --name gemini2api-ci -p 1800:1800 \
+            -e API_KEY=sk-ci -e ADMIN_KEY=sk-admin \
+            gemini2api:ci
+          # Give tini + python a moment to start.
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            sleep 1
+            if curl -fsS http://127.0.0.1:1800/health; then
+              break
+            fi
+          done
+          # /v1/models must 401 without a key, 200 with one.
+          curl -fsS -o /dev/null -w "no-auth status=%{http_code}\n" \
+            http://127.0.0.1:1800/v1/models
+          curl -fsS -o /dev/null -w "auth status=%{http_code}\n" \
+            -H "Authorization: Bearer sk-ci" http://127.0.0.1:1800/v1/models
+          docker stop gemini2api-ci

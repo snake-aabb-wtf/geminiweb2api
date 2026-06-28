@@ -168,7 +168,7 @@ def _meta_block(profile: ModelProfile, attachments: list[dict], tools: Optional[
         We append attachments (upload_ids) and the tools manifest as extras
         *after* the canonical 10 slots so we don't break compatibility.
     """
-    meta = ["", "", "", None, None, None, None, None, None, ""]
+    meta: list = ["", "", "", None, None, None, None, None, None, ""]
     # Attachments become additional elements appended after meta.
     if attachments:
         meta.extend(attachments)
@@ -530,7 +530,7 @@ async def send_request(
     headers = make_request_headers(profile, account)
 
     client = await get_client()
-    resp = await client.post(url, data=body, headers=headers)
+    resp = await client.post(url, content=body, headers=headers)
     if resp.status_code >= 400:
         # Surface the upstream body so callers can include it in the
         # error response to the user.
@@ -572,7 +572,7 @@ async def stream_request(
     text_chunks: list[str] = []
 
     try:
-        async with client.stream("POST", url, data=body, headers=headers, timeout=STREAM_TIMEOUT) as resp:
+        async with client.stream("POST", url, content=body, headers=headers, timeout=STREAM_TIMEOUT) as resp:
             if resp.status_code >= 400:
                 # Read the body to give a useful error, then bail.
                 err_body = (await resp.aread()).decode("utf-8", errors="replace")[:500]

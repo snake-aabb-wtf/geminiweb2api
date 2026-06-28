@@ -1,9 +1,9 @@
-# gemini2api v1.0
+# gemini2api v1.1
 
 > 把 Google Gemini 网页版 API 包装成 OpenAI 兼容接口。
 > 通过浏览器 HAR 文件提取认证参数,启动一个本地代理服务器。
 
-**v1.0 是一次较大重构**:全面修复了 v0.3 的安全 / 并发 / 正确性问题,新增鉴权、限流、真正流式、Token 统计、多模态、Function calling、WebUI 重做、51 个测试。详见 [CHANGELOG.md](CHANGELOG.md)。
+**v1.1 增量更新**:在 v1.0 之上,修复了 4 个数据竞争 / 状态污染 bug,新增 24h Token 用量、账号健康自检、多 API Key、Embeddings 占位、PII 脱敏,接入 `upload_image`,配置 Docker 镜像,启用 mypy 严格模式,87 个测试。详见 [CHANGELOG.md](CHANGELOG.md)。
 
 ---
 
@@ -29,6 +29,14 @@ pip install -r requirements.txt
 ```
 
 要求 Python 3.10+。Windows 用户直接双击 `start.bat`。
+
+### Docker(可选,v1.1+)
+
+```bash
+docker compose up -d
+```
+
+挂载 `.env` 只读 + `logs/` 持久化,自动健康检查。镜像基于 `python:3.12-slim`,约 150MB。
 
 ### 2. 导出 HAR 并生成配置
 
@@ -132,6 +140,8 @@ ADMIN_KEY=sk-my-admin-secret
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET | `/api/stats` | 池统计 + 账号详细状态 |
+| GET | `/api/usage?hours=24` | **v1.1** 24h Token 用量时序 + 汇总 |
+| POST | `/api/health/accounts` | **v1.1** 账号健康自检(并发 ping) |
 | GET | `/api/accounts` | 账号列表 |
 | POST | `/api/accounts` | 创建账号(JSON) |
 | PATCH | `/api/accounts/{name}` | 修改 enabled/bound/限流 |
@@ -142,6 +152,12 @@ ADMIN_KEY=sk-my-admin-secret
 | GET | `/api/events/stream` | **SSE** 实时日志推送 |
 | POST | `/api/auth/web_login` | 浏览器登录,设置 admin cookie |
 | POST | `/api/auth/logout` | 清除 cookie |
+
+### OpenAI 兼容 — Embeddings(`/v1/*`,需要 `API_KEY`)
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| POST | `/v1/embeddings` | **v1.1** Stub:返回 768 维零向量 + `X-Gemini2api-Status: stub` 头(需 `GEMINI_EMBEDDINGS_ENABLED=1`) |
 
 ### WebUI
 

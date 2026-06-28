@@ -46,6 +46,37 @@ def _scrub_extra(extra: Optional[dict]) -> dict:
     return out
 
 
+# ── PII redaction ────────────────────────────────────────────────────
+# Common PII shapes; intentionally narrow to avoid mangling normal
+# prose. Chinese ID numbers, mobile numbers, and email addresses.
+
+import re as _re
+
+_EMAIL_RE = _re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
+_CN_MOBILE_RE = _re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)")
+_CN_ID_RE = _re.compile(r"(?<!\d)[1-9]\d{5}(?:18|19|20)\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])\d{3}[\dXx](?!\d)")
+
+_PII_PATTERNS: tuple = (
+    (_EMAIL_RE, "<email>"),
+    (_CN_MOBILE_RE, "<mobile>"),
+    (_CN_ID_RE, "<id>"),
+)
+
+
+def scrub_pii(text: str) -> str:
+    """Best-effort PII redaction for log lines.
+
+    Replaces emails, Chinese mobile numbers, and Chinese ID-card
+    numbers with a placeholder marker. Idempotent and side-effect free.
+    """
+    if not text:
+        return text
+    out = text
+    for pattern, repl in _PII_PATTERNS:
+        out = pattern.sub(repl, out)
+    return out
+
+
 class _SafeLogger(logging.LoggerAdapter):
     """LoggerAdapter that scrubs ``extra`` of reserved keys before delegating."""
 

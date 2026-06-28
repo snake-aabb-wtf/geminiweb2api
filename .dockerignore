@@ -1,0 +1,35 @@
+# Files / dirs excluded from the Docker build context.
+# Keep the image small and avoid baking secrets into layers.
+
+.git
+.gitignore
+.github
+.venv
+venv
+env
+
+# Never bake credentials.
+.env
+*.har
+
+# Local artefacts that aren't needed at runtime.
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.coverage
+htmlcov
+.mypy_cache
+.ruff_cache
+
+# Tests don't run inside the image.
+tests/
+
+# Editor / OS junk.
+.vscode
+.idea
+.DS_Store
+
+# HAR captures and the gemini-proxy log itself.
+logs/
+*.log
